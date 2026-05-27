@@ -19,7 +19,7 @@ DATA := data
 INCLUDES := include
 
 NO_ICON := 1
-SERVER_HOST ?= 192.168.0.125
+SERVER_HOST ?= 192.168.0.124
 SERVER_PORT ?= 8000
 
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE

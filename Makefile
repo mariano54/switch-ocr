@@ -4,7 +4,7 @@ OVERLAY_DIR := /work/switch/overlay
 SYSMODULE_DIR := /work/switch/sysmodule
 DEVKIT_IMAGE := devkitpro/devkita64
 
-MAC_IP ?= $(shell ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 192.168.0.125)
+MAC_IP ?= 192.168.0.124
 SWITCH_IP ?=
 
 .PHONY: server switch-build switch-run switch-clean overlay-build overlay-clean overlay-install overlay-install-reload sysmodule-build sysmodule-clean sysmodule-install sysmodule-enable-boot switch-ocr-install tesla-hotkey-install
