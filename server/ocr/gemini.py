@@ -74,7 +74,7 @@ class GeminiOcrProvider:
             ],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 8192,
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
                 "responseSchema": OCR_RESPONSE_SCHEMA,
                 "candidateCount": 1,
@@ -98,7 +98,7 @@ class GeminiOcrProvider:
         )
         request = Request(
             url,
-            data=json.dumps(payload).encode("utf-8"),
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )

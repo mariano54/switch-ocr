@@ -52,16 +52,20 @@ constexpr size_t DefinitionSize = 384;
 constexpr size_t FrequencySize = 32;
 constexpr size_t KanjiSize = 128;
 constexpr size_t SentenceSize = 2048;
-constexpr size_t ResponseSize = 16384;
+constexpr size_t ResponseSize = 65536;
+constexpr size_t MaxSavedWords = 4096;
+constexpr size_t MiningRequestSize = 8192;
 constexpr u32 FramebufferWidth = 1280;
 constexpr u32 FramebufferHeight = 720;
 constexpr u32 LayerWidth = 1920;
 constexpr u32 LayerHeight = 1080;
 constexpr size_t OcrWorkerStackSize = 0x8000;
 constexpr u64 OcrWorkerSleepNs = 50000000;
+constexpr u64 MiningWorkerSleepNs = 100000000;
 constexpr u64 InputPollSleepNs = 20000000;
 constexpr u64 OcrRequestTimeoutNs = 20000000000ULL;
 constexpr u32 MinusCooldownFrames = 12;
+constexpr u32 MineCooldownFrames = 12;
 constexpr ViLayerStack ApplicationLayerStack = static_cast<ViLayerStack>(8);
 constexpr bool EnableSysmoduleViHud = false;
 
@@ -76,6 +80,7 @@ struct OcrWord {
     char kanji[KanjiSize];
     int frequency_value;
     bool selectable;
+    bool saved;
 };
 
 struct Color {
@@ -98,10 +103,18 @@ char g_request[256];
 char g_last_request[256];
 char g_response[ResponseSize];
 char g_status[512] = "Switch OCR HUD ready. Press Minus to OCR.";
+char g_mining_status[160] = "Mining sync pending.";
 char g_sentence[SentenceSize] = "No OCR result yet.";
 OcrWord g_words[MaxWords] = {};
+char g_saved_word_keys[MaxSavedWords][BaseSize] = {};
+char g_mining_request_body[MiningRequestSize] = "";
+char g_mining_response[ResponseSize] = "";
+char g_mining_body[ResponseSize] = "";
 size_t g_word_count = 0;
+size_t g_saved_word_key_count = 0;
 int g_selected_word = -1;
+int g_saved_word_total = 0;
+int g_lookup_count = 0;
 bool g_sm_initialized = false;
 bool g_fs_initialized = false;
 bool g_sd_mounted = false;
@@ -123,7 +136,18 @@ std::atomic<u64> g_ocr_started_tick = 0;
 std::atomic_int g_active_ocr_socket = -1;
 bool g_ocr_thread_started = false;
 Thread g_ocr_thread = {};
+std::atomic_int g_mining_action = 0;
+std::atomic_bool g_mining_worker_busy = false;
+std::atomic_bool g_mining_thread_running = false;
+bool g_mining_thread_started = false;
+Thread g_mining_thread = {};
 u32 g_loading_frame = 0;
+
+enum MiningAction {
+    MiningActionNone = 0,
+    MiningActionStatus = 1,
+    MiningActionMine = 2,
+};
 
 void set_status(const char *message) {
     snprintf(g_status, sizeof(g_status), "%s", message);
@@ -503,6 +527,53 @@ bool is_selectable_word(const OcrWord &word) {
     return word.definition[0] != '\0' || word.frequency[0] != '\0' || word.kanji[0] != '\0' || word.base[0] != '\0';
 }
 
+void copy_key_normalized(char *out, size_t out_size, const char *text) {
+    if (out_size == 0) {
+        return;
+    }
+    size_t used = 0;
+    for (const char *cursor = text != nullptr ? text : ""; *cursor != '\0' && used + 1 < out_size; cursor++) {
+        char ch = *cursor;
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        out[used++] = ch;
+    }
+    out[used] = '\0';
+}
+
+bool saved_key_matches(const char *candidate) {
+    if (candidate == nullptr || candidate[0] == '\0') {
+        return false;
+    }
+    char normalized[BaseSize];
+    copy_key_normalized(normalized, sizeof(normalized), candidate);
+    for (size_t i = 0; i < g_saved_word_key_count; i++) {
+        if (strcmp(g_saved_word_keys[i], normalized) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool word_saved_from_cache(const OcrWord &word) {
+    const char *base = word.base_plain[0] != '\0' ? word.base_plain : word.base;
+    const char *surface = word.surface_plain[0] != '\0' ? word.surface_plain : word.surface;
+    return saved_key_matches(base) || saved_key_matches(surface);
+}
+
+void refresh_saved_flags() {
+    for (size_t i = 0; i < g_word_count; i++) {
+        g_words[i].saved = word_saved_from_cache(g_words[i]);
+    }
+}
+
+void record_selected_lookup() {
+    if (g_selected_word >= 0 && g_selected_word < static_cast<int>(g_word_count) && g_words[g_selected_word].selectable) {
+        g_lookup_count++;
+    }
+}
+
 void format_selected_word_line(char *line, size_t line_size) {
     if (line_size == 0) {
         return;
@@ -537,24 +608,31 @@ void format_selected_word_line(char *line, size_t line_size) {
         append_text(line, line_size, "  ");
         append_text(line, line_size, word.kanji);
     }
+    append_text(line, line_size, word.saved ? "  Saved" : "  New");
 }
 
 void write_hud_state() {
     const OcrWord *word = (g_selected_word >= 0 && g_selected_word < static_cast<int>(g_word_count)) ? &g_words[g_selected_word] : nullptr;
     char frequency[FrequencySize * 2];
     char kanji[KanjiSize * 2];
+    char mining_status[320];
     copy_json_escaped(frequency, sizeof(frequency), word != nullptr ? word->frequency : "");
     copy_json_escaped(kanji, sizeof(kanji), word != nullptr ? word->kanji : "");
+    copy_json_escaped(mining_status, sizeof(mining_status), g_mining_status);
 
-    char state[384];
+    char state[768];
     snprintf(
         state,
         sizeof(state),
-        "{\"selected\":%d,\"pending\":%s,\"f\":\"%s\",\"k\":\"%s\"}",
+        "{\"selected\":%d,\"pending\":%s,\"f\":\"%s\",\"k\":\"%s\",\"saved\":%s,\"saved_count\":%d,\"lookup_count\":%d,\"m\":\"%s\"}",
         g_selected_word,
         g_ocr_pending.load(std::memory_order_acquire) ? "true" : "false",
         frequency,
-        kanji
+        kanji,
+        (word != nullptr && word->saved) ? "true" : "false",
+        g_saved_word_total,
+        g_lookup_count,
+        mining_status
     );
     write_text(HUD_PATH, state);
 }
@@ -594,18 +672,21 @@ void select_first_word() {
         }
     }
     if (g_selected_word >= 0) {
+        record_selected_lookup();
         return;
     }
 
     for (size_t i = 0; i < g_word_count; i++) {
         if (g_words[i].selectable) {
             g_selected_word = static_cast<int>(i);
+            record_selected_lookup();
             return;
         }
     }
 
     if (g_word_count > 0) {
         g_selected_word = 0;
+        record_selected_lookup();
     }
 }
 
@@ -627,6 +708,7 @@ void move_selection(int delta) {
 
         if (g_words[cursor].selectable) {
             g_selected_word = cursor;
+            record_selected_lookup();
             write_target_line();
             return;
         }
@@ -706,6 +788,7 @@ bool parse_words_json(const char *json) {
             }
         }
         word.selectable = is_selectable_word(word);
+        word.saved = word_saved_from_cache(word);
 
         if (word.surface[0] != '\0' || word.base[0] != '\0' || word.definition[0] != '\0') {
             append_text(g_sentence, sizeof(g_sentence), word.surface_plain[0] != '\0' ? word.surface_plain : word.base_plain);
@@ -1267,6 +1350,323 @@ bool queue_ocr_request(const char *source) {
     return true;
 }
 
+void cache_saved_key(const char *candidate) {
+    char normalized[BaseSize];
+    copy_key_normalized(normalized, sizeof(normalized), candidate);
+    if (normalized[0] == '\0' || saved_key_matches(normalized) || g_saved_word_key_count >= MaxSavedWords) {
+        return;
+    }
+    copy_text(g_saved_word_keys[g_saved_word_key_count++], BaseSize, normalized);
+}
+
+bool parse_saved_words_json(const char *json) {
+    int saved_count = -1;
+    if (parse_json_int_field(json, json + strlen(json), "saved_count", saved_count)) {
+        g_saved_word_total = saved_count;
+    }
+
+    const char *saved_words = strstr(json, "\"saved_words\"");
+    if (saved_words == nullptr) {
+        refresh_saved_flags();
+        return false;
+    }
+
+    const char *end = json + strlen(json);
+    const char *cursor = strchr(saved_words, '[');
+    if (cursor == nullptr) {
+        refresh_saved_flags();
+        return false;
+    }
+    cursor++;
+
+    g_saved_word_key_count = 0;
+    while (cursor < end && *cursor != ']' && g_saved_word_key_count < MaxSavedWords) {
+        skip_whitespace(cursor, end);
+        if (cursor >= end || *cursor == ']') {
+            break;
+        }
+        if (*cursor != '"') {
+            cursor++;
+            continue;
+        }
+
+        char raw_key[BaseSize] = "";
+        const char *next = parse_json_string(cursor, end, raw_key, sizeof(raw_key));
+        if (next == nullptr) {
+            break;
+        }
+        cache_saved_key(raw_key);
+        cursor = next;
+    }
+
+    if (g_saved_word_total < static_cast<int>(g_saved_word_key_count)) {
+        g_saved_word_total = static_cast<int>(g_saved_word_key_count);
+    }
+    refresh_saved_flags();
+    return true;
+}
+
+void mark_selected_word_saved() {
+    if (g_selected_word < 0 || g_selected_word >= static_cast<int>(g_word_count)) {
+        return;
+    }
+    OcrWord &word = g_words[g_selected_word];
+    const char *base = word.base_plain[0] != '\0' ? word.base_plain : word.base;
+    const char *surface = word.surface_plain[0] != '\0' ? word.surface_plain : word.surface;
+    cache_saved_key(base[0] != '\0' ? base : surface);
+    word.saved = true;
+    if (g_saved_word_total < static_cast<int>(g_saved_word_key_count)) {
+        g_saved_word_total = static_cast<int>(g_saved_word_key_count);
+    }
+}
+
+bool build_mine_word_body(char *out, size_t out_size) {
+    if (g_selected_word < 0 || g_selected_word >= static_cast<int>(g_word_count)) {
+        return false;
+    }
+
+    const OcrWord &word = g_words[g_selected_word];
+    char surface[SurfaceSize * 2];
+    char reading[ReadingSize * 2];
+    char base[BaseSize * 2];
+    char definition[DefinitionSize * 2];
+    char sentence[SentenceSize * 2];
+    copy_json_escaped(surface, sizeof(surface), word.surface_plain[0] != '\0' ? word.surface_plain : word.surface);
+    copy_json_escaped(reading, sizeof(reading), word.reading);
+    copy_json_escaped(base, sizeof(base), word.base_plain[0] != '\0' ? word.base_plain : word.base);
+    copy_json_escaped(definition, sizeof(definition), word.definition);
+    copy_json_escaped(sentence, sizeof(sentence), g_sentence);
+
+    const int written = snprintf(
+        out,
+        out_size,
+        "{\"provider\":\"issen\",\"surface\":\"%s\",\"reading\":\"%s\",\"base\":\"%s\",\"definition\":\"%s\",\"sentence\":\"%s\",\"language\":\"japanese\"}",
+        surface,
+        reading,
+        base,
+        definition,
+        sentence
+    );
+    return written > 0 && static_cast<size_t>(written) < out_size;
+}
+
+bool request_server_json(const char *method, const char *path, const char *body, char *body_out, size_t body_out_size) {
+    if (!init_socket_driver()) {
+        return false;
+    }
+    ensure_nifm_request_ready();
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return false;
+    }
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(SERVER_PORT);
+    if (inet_pton(AF_INET, SERVER_HOST, &addr.sin_addr) != 1 || !wait_for_tcp_connection(sock)) {
+        close(sock);
+        return false;
+    }
+
+    const char *request_body = body != nullptr ? body : "";
+    const size_t request_body_size = strlen(request_body);
+    char header[512];
+    const int header_size = snprintf(
+        header,
+        sizeof(header),
+        "%s %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Accept: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        method,
+        path,
+        SERVER_HOST,
+        SERVER_PORT,
+        request_body_size
+    );
+
+    if (header_size < 0 || static_cast<size_t>(header_size) >= sizeof(header) ||
+        send(sock, header, static_cast<size_t>(header_size), 0) < 0 ||
+        (request_body_size > 0 && send(sock, request_body, request_body_size, 0) < 0)) {
+        close(sock);
+        return false;
+    }
+
+    size_t used = 0;
+    while (used + 1 < sizeof(g_mining_response)) {
+        ssize_t received = recv(sock, g_mining_response + used, sizeof(g_mining_response) - used - 1, 0);
+        if (received < 0) {
+            close(sock);
+            return false;
+        }
+        if (received == 0) {
+            break;
+        }
+        used += static_cast<size_t>(received);
+        g_mining_response[used] = '\0';
+        const size_t expected_size = expected_http_response_size(g_mining_response, used);
+        if (expected_size > 0 && used >= expected_size) {
+            break;
+        }
+    }
+    close(sock);
+    g_mining_response[used] = '\0';
+
+    char *body_text = strstr(g_mining_response, "\r\n\r\n");
+    if (body_text == nullptr) {
+        return false;
+    }
+    body_text += 4;
+
+    const int http_status = parse_http_status(g_mining_response);
+    if (body_out_size > 0) {
+        snprintf(body_out, body_out_size, "%s", body_text);
+    }
+    return http_status >= 200 && http_status < 300;
+}
+
+void apply_mining_response(int action, const char *body_text, bool http_ok) {
+    parse_saved_words_json(body_text);
+
+    bool response_ok = http_ok;
+    parse_json_bool_field(body_text, "ok", response_ok);
+    if (!response_ok) {
+        char error[128];
+        if (!copy_json_string(body_text, "error", error, sizeof(error))) {
+            copy_text(error, sizeof(error), "Mining server unavailable");
+        }
+        snprintf(g_mining_status, sizeof(g_mining_status), "%s", error);
+        write_hud_state();
+        return;
+    }
+
+    if (action == MiningActionMine) {
+        bool already_saved = false;
+        parse_json_bool_field(body_text, "already_saved", already_saved);
+        if (already_saved) {
+            copy_text(g_mining_status, sizeof(g_mining_status), "Already saved.");
+        } else {
+            copy_text(g_mining_status, sizeof(g_mining_status), "Word saved.");
+            mark_selected_word_saved();
+        }
+        write_target_line();
+        return;
+    }
+
+    copy_text(g_mining_status, sizeof(g_mining_status), "Mining sync ready.");
+    write_hud_state();
+}
+
+bool queue_mining_status_request(const char *source) {
+    (void)source;
+    if (!g_mining_thread_started || g_mining_worker_busy.load(std::memory_order_acquire) ||
+        g_mining_action.load(std::memory_order_acquire) != MiningActionNone) {
+        return false;
+    }
+    g_mining_action.store(MiningActionStatus, std::memory_order_release);
+    return true;
+}
+
+bool queue_mine_selected_word() {
+    if (g_selected_word < 0 || g_selected_word >= static_cast<int>(g_word_count)) {
+        copy_text(g_mining_status, sizeof(g_mining_status), "No word selected.");
+        write_hud_state();
+        return false;
+    }
+    if (g_words[g_selected_word].saved) {
+        copy_text(g_mining_status, sizeof(g_mining_status), "Already saved.");
+        write_target_line();
+        return false;
+    }
+    if (!g_mining_thread_started || g_mining_worker_busy.load(std::memory_order_acquire) ||
+        g_mining_action.load(std::memory_order_acquire) != MiningActionNone) {
+        copy_text(g_mining_status, sizeof(g_mining_status), "Mining busy.");
+        write_hud_state();
+        return false;
+    }
+    if (!build_mine_word_body(g_mining_request_body, sizeof(g_mining_request_body))) {
+        copy_text(g_mining_status, sizeof(g_mining_status), "Could not mine word.");
+        write_hud_state();
+        return false;
+    }
+
+    copy_text(g_mining_status, sizeof(g_mining_status), "Mining word...");
+    write_hud_state();
+    g_mining_action.store(MiningActionMine, std::memory_order_release);
+    return true;
+}
+
+void mining_worker_entry(void *) {
+    while (g_mining_thread_running.load(std::memory_order_acquire)) {
+        const int action = g_mining_action.load(std::memory_order_acquire);
+        if (action == MiningActionNone) {
+            svcSleepThread(MiningWorkerSleepNs);
+            continue;
+        }
+
+        char body[MiningRequestSize];
+        body[0] = '\0';
+        if (action == MiningActionMine) {
+            copy_text(body, sizeof(body), g_mining_request_body);
+        }
+        g_mining_action.store(MiningActionNone, std::memory_order_release);
+        g_mining_worker_busy.store(true, std::memory_order_release);
+
+        g_mining_body[0] = '\0';
+        const bool http_ok = action == MiningActionStatus
+            ? request_server_json("GET", "/mining/status", "", g_mining_body, sizeof(g_mining_body))
+            : request_server_json("POST", "/mine-word", body, g_mining_body, sizeof(g_mining_body));
+        if (g_mining_body[0] == '\0') {
+            copy_text(g_mining_status, sizeof(g_mining_status), "Mining server unavailable.");
+            write_hud_state();
+        } else {
+            apply_mining_response(action, g_mining_body, http_ok);
+        }
+        g_mining_worker_busy.store(false, std::memory_order_release);
+    }
+}
+
+bool start_mining_worker() {
+    if (g_mining_thread_started) {
+        return true;
+    }
+
+    g_mining_thread_running.store(true, std::memory_order_release);
+    Result rc = threadCreate(&g_mining_thread, mining_worker_entry, nullptr, nullptr, 0x10000, 0x2d, -2);
+    if (R_FAILED(rc)) {
+        g_mining_thread_running.store(false, std::memory_order_release);
+        copy_text(g_mining_status, sizeof(g_mining_status), "Mining worker unavailable.");
+        write_hud_state();
+        return false;
+    }
+
+    rc = threadStart(&g_mining_thread);
+    if (R_FAILED(rc)) {
+        threadClose(&g_mining_thread);
+        g_mining_thread_running.store(false, std::memory_order_release);
+        copy_text(g_mining_status, sizeof(g_mining_status), "Mining worker failed.");
+        write_hud_state();
+        return false;
+    }
+
+    g_mining_thread_started = true;
+    return true;
+}
+
+void stop_mining_worker() {
+    if (!g_mining_thread_started) {
+        return;
+    }
+    g_mining_thread_running.store(false, std::memory_order_release);
+    threadWaitForExit(&g_mining_thread);
+    threadClose(&g_mining_thread);
+    g_mining_thread_started = false;
+}
+
 ssize_t decode_utf8_codepoint(u32 *out, const u8 *input) {
     if (input[0] < 0x80) {
         *out = input[0];
@@ -1651,19 +2051,27 @@ void poll_request_file() {
 void handle_input(u64 keys_down, u64 keys_held) {
     static u64 previous_held = 0;
     static u32 minus_cooldown = 0;
+    static u32 mine_cooldown = 0;
     const u64 interesting_buttons =
-        HidNpadButton_Minus | HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_AnyLeft | HidNpadButton_AnyRight;
+        HidNpadButton_Minus | HidNpadButton_StickR | HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_AnyLeft | HidNpadButton_AnyRight;
     const u64 current_held = keys_held & interesting_buttons;
     const bool minus_pressed = ((keys_down | (current_held & ~previous_held)) & HidNpadButton_Minus) != 0;
+    const bool mine_pressed = ((keys_down | (current_held & ~previous_held)) & HidNpadButton_StickR) != 0;
     const bool ocr_pending = g_ocr_pending.load(std::memory_order_acquire);
 
     if (minus_cooldown > 0) {
         minus_cooldown--;
     }
+    if (mine_cooldown > 0) {
+        mine_cooldown--;
+    }
 
     if (minus_pressed && minus_cooldown == 0) {
         minus_cooldown = MinusCooldownFrames;
         queue_ocr_request("Minus");
+    } else if (!ocr_pending && mine_pressed && mine_cooldown == 0) {
+        mine_cooldown = MineCooldownFrames;
+        queue_mine_selected_word();
     } else if (!ocr_pending && (keys_down & (HidNpadButton_Left | HidNpadButton_AnyLeft))) {
         move_selection(-1);
     } else if (!ocr_pending && (keys_down & (HidNpadButton_Right | HidNpadButton_AnyRight))) {
@@ -1685,6 +2093,7 @@ extern "C" void __appInit(void) {
 }
 
 extern "C" void __appExit(void) {
+    stop_mining_worker();
     stop_ocr_worker();
     if (g_socket_driver_initialized) {
         socketExit();
@@ -1730,6 +2139,9 @@ int main(int argc, char **argv) {
     write_text(TARGET_PATH, "No definition");
     write_hud_state();
     start_ocr_worker();
+    if (start_mining_worker()) {
+        queue_mining_status_request("startup");
+    }
 
     PadState pad;
     bool pad_ready = false;

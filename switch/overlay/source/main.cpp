@@ -27,6 +27,8 @@ constexpr size_t FrequencySize = 32;
 constexpr size_t KanjiSize = 128;
 constexpr size_t SentenceSize = 2048;
 constexpr size_t ResultJsonSize = 12000;
+constexpr size_t HudJsonSize = 1024;
+constexpr size_t MiningStatusSize = 160;
 
 struct OcrWord {
     char surface[SurfaceSize];
@@ -43,13 +45,17 @@ char g_status[512] = "Done";
 char g_result[SentenceSize] = "No OCR result yet.";
 char g_target[1024] = "No selected word yet.";
 char g_result_json[ResultJsonSize] = "";
-char g_hud_json[512] = "";
+char g_hud_json[HudJsonSize] = "";
 char g_hud_frequency[FrequencySize] = "";
 char g_hud_kanji[KanjiSize] = "";
+char g_hud_mining_status[MiningStatusSize] = "";
 OcrWord g_words[MaxWords] = {};
 size_t g_word_count = 0;
 int g_selected_word = -1;
+int g_saved_word_total = 0;
+int g_lookup_count = 0;
 bool g_hud_pending = false;
+bool g_hud_saved = false;
 bool g_sd_mounted = false;
 
 void copyText(char *out, size_t outSize, const char *text) {
@@ -464,9 +470,18 @@ void parseHudJson(const char *json) {
     }
     g_hud_frequency[0] = '\0';
     g_hud_kanji[0] = '\0';
+    g_hud_mining_status[0] = '\0';
+    g_hud_saved = false;
     if (!hasSelected || g_selected_word >= 0) {
         parseJsonField(json, end, "f", g_hud_frequency, sizeof(g_hud_frequency));
         parseJsonField(json, end, "k", g_hud_kanji, sizeof(g_hud_kanji));
+    }
+    parseJsonField(json, end, "m", g_hud_mining_status, sizeof(g_hud_mining_status));
+    parseJsonIntField(json, end, "saved_count", g_saved_word_total);
+    parseJsonIntField(json, end, "lookup_count", g_lookup_count);
+    bool saved = false;
+    if (parseJsonBoolField(json, end, "saved", saved)) {
+        g_hud_saved = saved;
     }
     bool pending = false;
     if (parseJsonBoolField(json, end, "pending", pending)) {
@@ -711,7 +726,12 @@ public:
             out[0] = '\0';
             const char *frequency = g_hud_frequency[0] != '\0' ? g_hud_frequency : word.frequency;
             const char *kanji = g_hud_kanji[0] != '\0' ? g_hud_kanji : word.kanji;
+            char totals[64];
+            snprintf(totals, sizeof(totals), "Lookups %d   Words %d", g_lookup_count, g_saved_word_total);
+            appendText(out, outSize, totals);
+            appendText(out, outSize, g_hud_saved ? "   Saved" : "   New");
             if (frequency[0] != '\0') {
+                appendText(out, outSize, "   ");
                 appendText(out, outSize, "Freq ");
                 appendText(out, outSize, frequency);
             }

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from frame_capture import RollingBridgeCapture, capture_bridge_frame, cleanup_capture_artifacts, config_from_env
+from mining import MiningService, create_mining_service_from_env
 from ocr import perform_ocr
 from ocr.formatting import switch_display_text
 
@@ -20,10 +21,15 @@ SERVER_DIR = Path(__file__).resolve().parent
 LAST_OCR_UPLOAD = SERVER_DIR / "last_ocr_upload.jpg"
 LATEST_FRAME = SERVER_DIR / "latest_frame.jpg"
 UDP_RESPONSE_LIMIT = 12_000
+MINING_SERVICE: MiningService | None = None
 
 
 def recent_frame_fallback_seconds() -> float:
     return float(os.environ.get("SYSDVR_RECENT_FRAME_FALLBACK_SECONDS", "2.0"))
+
+
+def ready_frame_max_age_seconds() -> float:
+    return float(os.environ.get("SYSDVR_READY_FRAME_MAX_AGE_SECONDS", "1.5"))
 
 
 def latest_frame_metadata() -> dict[str, Any]:
@@ -45,6 +51,18 @@ def latest_frame_age_seconds() -> float | None:
     return time.time() - LATEST_FRAME.stat().st_mtime
 
 
+def latest_frame_status_payload() -> dict[str, Any]:
+    frame_age = latest_frame_age_seconds()
+    max_ready_age = ready_frame_max_age_seconds()
+    ready = frame_age is not None and max_ready_age > 0 and frame_age <= max_ready_age
+    return {
+        "ok": ready,
+        "ready": ready,
+        "max_ready_age_seconds": max_ready_age,
+        **latest_frame_metadata(),
+    }
+
+
 def concise_error(message: str) -> str:
     return message.splitlines()[0].strip() if message.strip() else "Unknown error"
 
@@ -52,24 +70,29 @@ def concise_error(message: str) -> str:
 def ocr_latest_payload() -> dict[str, Any]:
     started = time.time()
     capture_error = ""
+    capture_performed = False
     if os.environ.get("SYSDVR_CAPTURE_ON_REQUEST", "1") != "0":
-        try:
-            capture_bridge_frame(LATEST_FRAME, config_from_env())
-        except Exception as exc:
-            capture_error = str(exc)
-            print(f"[FrameCapture] on-request capture failed: {exc}", flush=True)
-            fallback_seconds = recent_frame_fallback_seconds()
-            frame_age = latest_frame_age_seconds()
-            if frame_age is None or frame_age > fallback_seconds:
-                return {
-                    "ok": False,
-                    "success": False,
-                    "error": f"Frame capture failed: {concise_error(capture_error)}",
-                    "capture_error": capture_error,
-                    "display_text": "Mac frame capture failed.",
-                    **latest_frame_metadata(),
-                }
-            print(f"[FrameCapture] using recent frame after capture failure, age={frame_age:.2f}s", flush=True)
+        frame_age = latest_frame_age_seconds()
+        max_ready_age = ready_frame_max_age_seconds()
+        if frame_age is None or max_ready_age <= 0 or frame_age > max_ready_age:
+            try:
+                capture_bridge_frame(LATEST_FRAME, config_from_env())
+                capture_performed = True
+            except Exception as exc:
+                capture_error = str(exc)
+                print(f"[FrameCapture] on-request capture failed: {exc}", flush=True)
+                fallback_seconds = recent_frame_fallback_seconds()
+                frame_age = latest_frame_age_seconds()
+                if frame_age is None or frame_age > fallback_seconds:
+                    return {
+                        "ok": False,
+                        "success": False,
+                        "error": f"Frame capture failed: {concise_error(capture_error)}",
+                        "capture_error": capture_error,
+                        "display_text": "Mac frame capture failed.",
+                        **latest_frame_metadata(),
+                    }
+                print(f"[FrameCapture] using recent frame after capture failure, age={frame_age:.2f}s", flush=True)
 
     if not LATEST_FRAME.exists():
         return {
@@ -82,6 +105,8 @@ def ocr_latest_payload() -> dict[str, Any]:
     body = LATEST_FRAME.read_bytes()
     payload = ocr_bytes_payload(body, "image/jpeg", LATEST_FRAME)
     payload.update(latest_frame_metadata())
+    payload["capture_performed"] = capture_performed
+    payload["total_elapsed_seconds"] = round(time.time() - started, 3)
     if capture_error:
         payload["capture_error"] = capture_error
         payload["frame_fallback"] = "recent"
@@ -90,10 +115,12 @@ def ocr_latest_payload() -> dict[str, Any]:
 
 
 def ocr_bytes_payload(body: bytes, content_type: str, source_path: Path) -> dict[str, Any]:
+    started = time.time()
     result = perform_ocr(body, mime_type=content_type)
     result["ok"] = bool(result.get("success"))
     result["bytes"] = len(body)
     result["source"] = str(source_path)
+    result["ocr_elapsed_seconds"] = round(time.time() - started, 3)
     return result
 
 
@@ -125,7 +152,17 @@ def compact_switch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if "error" in payload:
         compact["error"] = str(payload.get("error", ""))
-    for key in ("capture_error", "source", "frame_age_seconds", "frame_mtime", "bytes"):
+    for key in (
+        "capture_error",
+        "capture_performed",
+        "frame_fallback",
+        "source",
+        "frame_age_seconds",
+        "frame_mtime",
+        "bytes",
+        "ocr_elapsed_seconds",
+        "total_elapsed_seconds",
+    ):
         if key in payload:
             compact[key] = payload[key]
 
@@ -147,6 +184,13 @@ def compact_switch_payload(payload: dict[str, Any]) -> dict[str, Any]:
         compact["words"] = compact_words
 
     return compact
+
+
+def mining_service() -> MiningService:
+    global MINING_SERVICE
+    if MINING_SERVICE is None:
+        MINING_SERVICE = create_mining_service_from_env()
+    return MINING_SERVICE
 
 
 class UdpOcrServer:
@@ -206,6 +250,14 @@ class OcrDevHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
 
+        if self.path == "/mining/status":
+            self._send_json(mining_service().status_payload(include_saved_words=True))
+            return
+
+        if self.path == "/frame-status":
+            self._send_json(latest_frame_status_payload())
+            return
+
         self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -249,10 +301,19 @@ class OcrDevHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
 
+        if self.path == "/mine-word":
+            payload = mining_service().mine_word(self._read_json())
+            status = HTTPStatus.OK if payload.get("ok") else HTTPStatus.SERVICE_UNAVAILABLE
+            self._send_json(payload, status)
+            return
+
         self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"{self.client_address[0]} - {fmt % args}", flush=True)
+        try:
+            print(f"{self.client_address[0]} - {fmt % args}", flush=True)
+        except BrokenPipeError:
+            pass
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))
@@ -284,6 +345,15 @@ def main() -> None:
     args = parser.parse_args()
 
     cleanup_capture_artifacts(SERVER_DIR)
+    global MINING_SERVICE
+    MINING_SERVICE = create_mining_service_from_env()
+    MINING_SERVICE.startup()
+    mining_status = MINING_SERVICE.status_payload()
+    if mining_status.get("ok"):
+        print(f"[Mining] {mining_status['provider']} ready with {mining_status['saved_count']} saved words", flush=True)
+    else:
+        print(f"[Mining] unavailable: {mining_status.get('error', 'not configured')}", flush=True)
+
     capture_worker: RollingBridgeCapture | None = None
     if not args.no_frame_capture and os.environ.get("SYSDVR_BACKGROUND_CAPTURE", "0") != "0":
         capture_worker = RollingBridgeCapture(

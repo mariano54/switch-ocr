@@ -7,16 +7,22 @@ import shutil
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
+
+import fcntl
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CLIENT_PATH = ROOT_DIR / "tmp" / "sysdvr-client" / "mac-arm64" / "SysDVR-Client"
+DEFAULT_LOCK_PATH = ROOT_DIR / "tmp" / "sysdvr-capture.lock"
 DEFAULT_RECORD_SECONDS = 0.85
 DEFAULT_CAPTURE_RETRIES = 3
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.5
 DEFAULT_STOP_TIMEOUT_SECONDS = 8.0
+CAPTURE_LOCK = threading.Lock()
 
 
 class FrameCaptureError(RuntimeError):
@@ -89,11 +95,28 @@ class RollingBridgeCapture:
                 print(f"[FrameCapture] {self.last_error}", flush=True)
 
             elapsed = time.monotonic() - started
-            wait_seconds = max(10.0 if self.last_error else 2.0, self.interval_seconds - elapsed)
+            wait_seconds = max(10.0 if self.last_error else 0.0, self.interval_seconds - elapsed)
             self._stop_event.wait(wait_seconds)
 
 
 def capture_bridge_frame(output_path: Path, config: BridgeCaptureConfig) -> None:
+    with CAPTURE_LOCK:
+        with _bridge_capture_file_lock():
+            _capture_bridge_frame_locked(output_path, config)
+
+
+@contextmanager
+def _bridge_capture_file_lock() -> Iterator[None]:
+    DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEFAULT_LOCK_PATH.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _capture_bridge_frame_locked(output_path: Path, config: BridgeCaptureConfig) -> None:
     if not config.client_path.exists():
         raise FrameCaptureError(f"SysDVR client not found at {config.client_path}")
 

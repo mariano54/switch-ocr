@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 
+from .tokens import suppress_definition
 from .types import OcrWord
 
 TAG_RE = re.compile(r"<[^>]+>")
@@ -95,10 +96,15 @@ def normalize_words(raw_words: object) -> list[OcrWord]:
         if reading == surface:
             reading = ""
 
+        translation = str(item.get("t", "")).strip()
+        if suppress_definition(surface, base):
+            base = ""
+            translation = ""
+
         word = {
             "w": surface,
             "b": base,
-            "t": str(item.get("t", "")),
+            "t": translation,
         }
         if reading:
             word["r"] = reading

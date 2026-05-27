@@ -6,6 +6,7 @@ from .formatting import strip_html
 from .frequency_dictionary import lookup_frequency_terms
 from .jmdict_dictionary import lookup_terms
 from .kanji_dictionary import lookup_kanji_text
+from .tokens import suppress_definition
 from .types import OcrWord
 
 
@@ -14,6 +15,9 @@ def _plain(text: str) -> str:
 
 
 def _word_terms(word: OcrWord) -> list[str]:
+    if suppress_definition(_plain(word.get("w", "")), _plain(word.get("b", ""))):
+        return []
+
     terms = [_plain(word.get("b", "")), _plain(word.get("w", ""))]
     for term in list(terms):
         if term.endswith("する") and len(term) > 2:
@@ -41,6 +45,12 @@ def enrich_words(words: list[OcrWord]) -> list[OcrWord]:
     enriched: list[OcrWord] = []
     for word, word_terms in zip(words, term_lists):
         output: OcrWord = dict(word)
+        if not word_terms and suppress_definition(_plain(word.get("w", "")), _plain(word.get("b", ""))):
+            output["b"] = ""
+            output["t"] = ""
+            enriched.append(output)
+            continue
+
         for term in word_terms:
             entry = jmdict_matches.get(term)
             if entry is not None:

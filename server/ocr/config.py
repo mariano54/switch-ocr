@@ -25,4 +25,4 @@ def google_api_key() -> str | None:
 
 
 def gemini_model() -> str:
-    return os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+    return os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
