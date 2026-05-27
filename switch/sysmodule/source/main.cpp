@@ -1043,24 +1043,26 @@ public:
         m_current_framebuffer = framebufferBegin(&m_framebuffer, nullptr);
         clear_screen();
 
-        constexpr s32 panel_x = 0;
-        constexpr s32 panel_h = 100;
-        constexpr s32 panel_y = FramebufferHeight - panel_h;
-        constexpr s32 panel_w = FramebufferWidth;
-        draw_rect(panel_x, panel_y, panel_w, panel_h, Color(0, 0, 0, 14));
-        draw_rect(panel_x, panel_y, 16, panel_h, Color(0, 15, 13, 15));
+        constexpr s32 panel_x = 24;
+        constexpr s32 panel_y = 532;
+        constexpr s32 panel_w = 1232;
+        constexpr s32 panel_h = 164;
+        draw_rect(panel_x, panel_y, panel_w, panel_h, Color(0, 0, 0, 11));
+        draw_rect(panel_x, panel_y, panel_w, 4, Color(0, 15, 13, 15));
 
         if (!m_font_ready) {
-            draw_rect(panel_x + 14, panel_y + 24, 520, 20, Color(15, 15, 15, 15));
-            draw_rect(panel_x + 14, panel_y + 58, 720, 22, Color(0, 15, 13, 15));
+            draw_rect(panel_x + 22, panel_y + 38, 520, 20, Color(15, 15, 15, 15));
+            draw_rect(panel_x + 22, panel_y + 84, 720, 22, Color(0, 15, 13, 15));
             eventWait(&m_vsync_event, UINT64_MAX);
             framebufferEnd(&m_framebuffer);
             m_current_framebuffer = nullptr;
             return;
         }
 
-        draw_words_line(panel_x + 14, panel_y + 28, 20.0F, panel_w - 28);
-        draw_selected_word(panel_x + 14, panel_y + 66, panel_w - 28);
+        draw_words_line(panel_x + 22, panel_y + 42, 20.0F, panel_w - 44);
+        draw_selected_word(panel_x + 22, panel_y + 92, panel_w - 44);
+        draw_string(g_status, panel_x + 23, panel_y + 139, 16.0F, Color(0, 0, 0, 15), panel_w - 44);
+        draw_string(g_status, panel_x + 22, panel_y + 138, 16.0F, Color(12, 12, 12, 15), panel_w - 44);
 
         eventWait(&m_vsync_event, UINT64_MAX);
         framebufferEnd(&m_framebuffer);
@@ -1208,30 +1210,19 @@ private:
             const char *dots[] = {".", "..", "..."};
             char message[160];
             snprintf(message, sizeof(message), "OCR pending%s", dots[(g_loading_frame++ / 8) % 3]);
-            draw_string(message, x + 1, y + 1, 22.0F, Color(0, 0, 0, 15), max_width);
-            draw_string(message, x, y, 22.0F, Color(0, 15, 13, 15), max_width);
+            draw_string(message, x + 1, y + 1, 20.0F, Color(0, 0, 0, 15), max_width);
+            draw_string(message, x, y, 20.0F, Color(0, 15, 13, 15), max_width);
             return;
         }
 
         if (g_selected_word < 0 || g_selected_word >= static_cast<int>(g_word_count)) {
-            draw_string("No definition", x + 1, y + 1, 22.0F, Color(0, 0, 0, 15), max_width);
-            draw_string("No definition", x, y, 22.0F, Color(13, 13, 13, 15), max_width);
+            draw_string("No definition", x + 1, y + 1, 20.0F, Color(0, 0, 0, 15), max_width);
+            draw_string("No definition", x, y, 20.0F, Color(13, 13, 13, 15), max_width);
             return;
         }
 
         const OcrWord &word = g_words[g_selected_word];
-        const Color word_color(0, 15, 13, 15);
-        const Color definition_color(15, 15, 15, 15);
-        const Color meta_color(12, 12, 12, 15);
-        s32 x_cursor = x;
-        auto draw_segment = [&](const char *text, Color color) {
-            const s32 remaining_width = max_width - (x_cursor - x);
-            if (remaining_width > 0) {
-                draw_string(text, x_cursor + 1, y + 1, 22.0F, Color(0, 0, 0, 15), remaining_width);
-                x_cursor = draw_string(text, x_cursor, y, 22.0F, color, remaining_width);
-            }
-        };
-
+        char line[640];
         char word_label[320];
         const char *surface = word.surface_plain[0] != '\0' ? word.surface_plain : word.surface;
         const char *base = word.base_plain[0] != '\0' ? word.base_plain : surface;
@@ -1240,18 +1231,17 @@ private:
         } else {
             snprintf(word_label, sizeof(word_label), "%s", surface);
         }
-        draw_segment(word_label, word_color);
-        draw_segment("  ", definition_color);
-        draw_segment(word.definition[0] != '\0' ? word.definition : "No definition", definition_color);
+        snprintf(line, sizeof(line), "%s  %s", word_label, word.definition[0] != '\0' ? word.definition : "No definition");
         if (word.frequency[0] != '\0') {
-            char frequency[64];
-            snprintf(frequency, sizeof(frequency), "  Freq %s", word.frequency);
-            draw_segment(frequency, meta_color);
+            append_text(line, sizeof(line), "  Freq ");
+            append_text(line, sizeof(line), word.frequency);
         }
         if (word.kanji[0] != '\0') {
-            draw_segment("   ", meta_color);
-            draw_segment(word.kanji, meta_color);
+            append_text(line, sizeof(line), "  ");
+            append_text(line, sizeof(line), word.kanji);
         }
+        draw_string(line, x + 1, y + 1, 20.0F, Color(0, 0, 0, 15), max_width);
+        draw_string(line, x, y, 20.0F, Color(15, 15, 15, 15), max_width);
     }
 
     void draw_words_line(s32 x, s32 y, float font_size, s32 max_width) {
