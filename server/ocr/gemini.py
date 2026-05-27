@@ -18,6 +18,25 @@ from .types import OcrResult
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
+OCR_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "words": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "w": {"type": "STRING"},
+                    "b": {"type": "STRING"},
+                    "t": {"type": "STRING"},
+                },
+                "required": ["w", "b", "t"],
+            },
+        },
+    },
+    "required": ["words"],
+}
+
 
 class GeminiOcrProvider:
     name = "gemini"
@@ -57,6 +76,7 @@ class GeminiOcrProvider:
                 "temperature": 0.1,
                 "maxOutputTokens": 8192,
                 "responseMimeType": "application/json",
+                "responseSchema": OCR_RESPONSE_SCHEMA,
                 "candidateCount": 1,
                 "thinkingConfig": {
                     "thinkingBudget": 0,

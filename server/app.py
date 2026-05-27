@@ -22,13 +22,37 @@ LATEST_FRAME = SERVER_DIR / "latest_frame.jpg"
 UDP_RESPONSE_LIMIT = 12_000
 
 
+def latest_frame_metadata() -> dict[str, Any]:
+    if not LATEST_FRAME.exists():
+        return {}
+
+    stat = LATEST_FRAME.stat()
+    return {
+        "source": str(LATEST_FRAME),
+        "frame_age_seconds": round(time.time() - stat.st_mtime, 1),
+        "frame_mtime": stat.st_mtime,
+        "bytes": stat.st_size,
+    }
+
+
 def ocr_latest_payload() -> dict[str, Any]:
     started = time.time()
+    capture_error = ""
     if os.environ.get("SYSDVR_CAPTURE_ON_REQUEST", "1") != "0":
         try:
             capture_bridge_frame(LATEST_FRAME, config_from_env())
         except Exception as exc:
+            capture_error = str(exc)
             print(f"[FrameCapture] on-request capture failed: {exc}", flush=True)
+            if os.environ.get("SYSDVR_ALLOW_STALE_FRAME_ON_CAPTURE_FAIL", "0") != "1":
+                return {
+                    "ok": False,
+                    "success": False,
+                    "error": f"Frame capture failed: {capture_error}",
+                    "capture_error": capture_error,
+                    "display_text": "Mac frame capture failed.",
+                    **latest_frame_metadata(),
+                }
 
     if not LATEST_FRAME.exists():
         return {
@@ -40,6 +64,9 @@ def ocr_latest_payload() -> dict[str, Any]:
 
     body = LATEST_FRAME.read_bytes()
     payload = ocr_bytes_payload(body, "image/jpeg", LATEST_FRAME)
+    payload.update(latest_frame_metadata())
+    if capture_error:
+        payload["capture_error"] = capture_error
     print(f"[SwitchOCR] /ocr-latest total {time.time() - started:.2f}s, bytes={len(body)}", flush=True)
     return payload
 
@@ -80,6 +107,9 @@ def compact_switch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if "error" in payload:
         compact["error"] = str(payload.get("error", ""))
+    for key in ("capture_error", "source", "frame_age_seconds", "frame_mtime", "bytes"):
+        if key in payload:
+            compact[key] = payload[key]
 
     if isinstance(words, list):
         compact_words: list[dict[str, str]] = []
@@ -91,7 +121,7 @@ def compact_switch_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "b": str(word.get("b", ""))[:160],
                 "t": str(word.get("t", ""))[:240],
             }
-            for key, limit in (("f", 24), ("fv", 12), ("k", 96)):
+            for key, limit in (("r", 80), ("f", 24), ("fv", 12), ("k", 96)):
                 value = str(word.get(key, ""))[:limit]
                 if value:
                     compact_word[key] = value

@@ -31,6 +31,7 @@ IMPORTANT: For both "w" and "b", if they contain any kanji characters, format th
 Example: "日本語" -> "<ruby>日本語<rt>にほんご</rt></ruby>"
 If a word does not contain kanji, return it as plain text without ruby tags.
 VERY IMPORTANT: Choose furigana readings from the sentence/dialogue context, not from isolated dictionary guesses.
+Do not use parenthetical readings such as "日本語(にほんご)"; ruby tags are used only so the server can extract a separate reading field.
 
 Return ONLY valid JSON of the form: {"words":[{"w":"...","b":"...","t":"..."}]}
 No markdown, no code fences, no extra keys.

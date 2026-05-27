@@ -15,6 +15,9 @@ def _plain(text: str) -> str:
 
 def _word_terms(word: OcrWord) -> list[str]:
     terms = [_plain(word.get("b", "")), _plain(word.get("w", ""))]
+    for term in list(terms):
+        if term.endswith("する") and len(term) > 2:
+            terms.append(term[:-2])
     return list(dict.fromkeys(term for term in terms if term))
 
 

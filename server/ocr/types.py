@@ -6,6 +6,7 @@ from typing import Any, TypedDict
 class OcrWord(TypedDict, total=False):
     w: str
     b: str
+    r: str
     t: str
     f: str
     fv: str

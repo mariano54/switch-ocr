@@ -13,6 +13,8 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CLIENT_PATH = ROOT_DIR / "tmp" / "sysdvr-client" / "mac-arm64" / "SysDVR-Client"
+DEFAULT_RECORD_SECONDS = 0.6
+DEFAULT_CAPTURE_RETRIES = 2
 
 
 class FrameCaptureError(RuntimeError):
@@ -23,7 +25,8 @@ class FrameCaptureError(RuntimeError):
 class BridgeCaptureConfig:
     switch_ip: str
     client_path: Path = DEFAULT_CLIENT_PATH
-    record_seconds: float = 8.0
+    record_seconds: float = DEFAULT_RECORD_SECONDS
+    capture_retries: int = DEFAULT_CAPTURE_RETRIES
     connect_timeout_seconds: float = 25.0
     stop_timeout_seconds: float = 12.0
     use_pty: bool = False
@@ -33,7 +36,8 @@ def config_from_env() -> BridgeCaptureConfig:
     return BridgeCaptureConfig(
         switch_ip=os.environ.get("SWITCH_IP", "192.168.0.136"),
         client_path=Path(os.environ.get("SYSDVR_CLIENT", str(DEFAULT_CLIENT_PATH))),
-        record_seconds=float(os.environ.get("SYSDVR_RECORD_SECONDS", "8.0")),
+        record_seconds=float(os.environ.get("SYSDVR_RECORD_SECONDS", str(DEFAULT_RECORD_SECONDS))),
+        capture_retries=int(os.environ.get("SYSDVR_CAPTURE_RETRIES", str(DEFAULT_CAPTURE_RETRIES))),
         use_pty=os.environ.get("SYSDVR_USE_PTY", "0") == "1",
     )
 
@@ -89,6 +93,23 @@ def capture_bridge_frame(output_path: Path, config: BridgeCaptureConfig) -> None
     if not config.client_path.exists():
         raise FrameCaptureError(f"SysDVR client not found at {config.client_path}")
 
+    attempts = max(1, config.capture_retries + 1)
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            _capture_bridge_frame_once(output_path, config)
+            return
+        except FrameCaptureError as error:
+            last_error = str(error)
+            _cleanup_bridge_attempt(output_path, config.client_path)
+            if attempt == attempts:
+                break
+            time.sleep(min(0.5, 0.2 * attempt))
+
+    raise FrameCaptureError(f"SysDVR frame capture failed after {attempts} attempts. Last error: {last_error}")
+
+
+def _capture_bridge_frame_once(output_path: Path, config: BridgeCaptureConfig) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     video_path = output_path.with_suffix(".sysdvr.tmp.mp4")
     frame_path = output_path.with_suffix(".tmp.jpg")
@@ -102,6 +123,12 @@ def capture_bridge_frame(output_path: Path, config: BridgeCaptureConfig) -> None
     finally:
         video_path.unlink(missing_ok=True)
         frame_path.unlink(missing_ok=True)
+
+
+def _cleanup_bridge_attempt(output_path: Path, client_path: Path) -> None:
+    output_path.with_suffix(".sysdvr.tmp.mp4").unlink(missing_ok=True)
+    output_path.with_suffix(".tmp.jpg").unlink(missing_ok=True)
+    _kill_stale_sysdvr_client(client_path)
 
 
 def _record_bridge_clip(video_path: Path, config: BridgeCaptureConfig) -> None:
@@ -174,7 +201,7 @@ def _record_bridge_clip(video_path: Path, config: BridgeCaptureConfig) -> None:
     while time.monotonic() < deadline:
         if process.poll() is not None:
             break
-        if any("Recording started" in line for line in lines):
+        if any("Recording started" in line or "Decoder.CodecCtx uses pixel format" in line for line in lines):
             started = True
             break
         time.sleep(0.1)
@@ -184,7 +211,7 @@ def _record_bridge_clip(video_path: Path, config: BridgeCaptureConfig) -> None:
         raise FrameCaptureError(_summarize_failure("SysDVR bridge did not start recording", lines))
 
     time.sleep(config.record_seconds)
-    _stop_process(process, signal.SIGINT, config.stop_timeout_seconds)
+    _stop_recording_process(process, master_fd, config.stop_timeout_seconds)
     reader.join(timeout=1)
 
     if not video_path.exists() or video_path.stat().st_size == 0:
@@ -231,6 +258,25 @@ def _find_ffmpeg() -> Path:
             return candidate
 
     raise FrameCaptureError("ffmpeg is not installed or not on PATH")
+
+
+def _stop_recording_process(process: subprocess.Popen[str], master_fd: int | None, timeout_seconds: float) -> None:
+    if process.poll() is not None:
+        return
+
+    try:
+        if master_fd is not None:
+            os.write(master_fd, b"\n")
+        elif process.stdin is not None:
+            process.stdin.write("\n")
+            process.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _stop_process(process, signal.SIGINT, timeout_seconds)
 
 
 def _stop_process(process: subprocess.Popen[str], sig: signal.Signals, timeout_seconds: float) -> None:

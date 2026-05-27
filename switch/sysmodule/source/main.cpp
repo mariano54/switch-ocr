@@ -4,6 +4,7 @@
 #include <stb_truetype.h>
 
 #include <algorithm>
+#include <atomic>
 #include <arpa/inet.h>
 #include <cwctype>
 #include <errno.h>
@@ -27,7 +28,9 @@
 #define REQUEST_PATH CONFIG_DIR "/request.txt"
 #define RESULT_PATH CONFIG_DIR "/result.txt"
 #define RESULT_JSON_PATH CONFIG_DIR "/result.json"
+#define TARGET_PATH CONFIG_DIR "/target.txt"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
+#define HUD_PATH CONFIG_DIR "/hud.json"
 #define DEBUG_PATH CONFIG_DIR "/debug.txt"
 
 extern "C" {
@@ -44,6 +47,7 @@ namespace {
 constexpr size_t MaxWords = 48;
 constexpr size_t SurfaceSize = 160;
 constexpr size_t BaseSize = 160;
+constexpr size_t ReadingSize = 128;
 constexpr size_t DefinitionSize = 384;
 constexpr size_t FrequencySize = 32;
 constexpr size_t KanjiSize = 128;
@@ -53,13 +57,19 @@ constexpr u32 FramebufferWidth = 1280;
 constexpr u32 FramebufferHeight = 720;
 constexpr u32 LayerWidth = 1920;
 constexpr u32 LayerHeight = 1080;
+constexpr size_t OcrWorkerStackSize = 0x8000;
+constexpr u64 OcrWorkerSleepNs = 50000000;
+constexpr u64 InputPollSleepNs = 20000000;
+constexpr u32 MinusCooldownFrames = 12;
 constexpr ViLayerStack ApplicationLayerStack = static_cast<ViLayerStack>(8);
+constexpr bool EnableSysmoduleViHud = false;
 
 struct OcrWord {
     char surface[SurfaceSize];
     char surface_plain[SurfaceSize];
     char base[BaseSize];
     char base_plain[BaseSize];
+    char reading[ReadingSize];
     char definition[DefinitionSize];
     char frequency[FrequencySize];
     char kanji[KanjiSize];
@@ -102,7 +112,14 @@ bool g_nifm_initialized = false;
 bool g_nifm_request_ready = false;
 NifmRequest g_nifm_request = {};
 u32 g_request_count = 0;
-bool g_ocr_pending = false;
+std::atomic_bool g_ocr_pending = false;
+std::atomic_bool g_ocr_requested = false;
+std::atomic_bool g_ocr_worker_busy = false;
+std::atomic_bool g_ocr_thread_running = false;
+std::atomic<u32> g_ocr_generation = 0;
+std::atomic_int g_active_ocr_socket = -1;
+bool g_ocr_thread_started = false;
+Thread g_ocr_thread = {};
 u32 g_loading_frame = 0;
 
 void set_status(const char *message) {
@@ -366,89 +383,6 @@ bool parse_json_int_field(const char *object_start, const char *object_end, cons
     return true;
 }
 
-void append_limited(char *out, size_t out_size, size_t &used, const char *text, size_t text_size) {
-    for (size_t i = 0; i < text_size && text[i] != '\0' && used + 1 < out_size; i++) {
-        out[used++] = text[i];
-    }
-    out[used] = '\0';
-}
-
-bool same_text(const char *left, const char *right) {
-    return strcmp(left, right) == 0;
-}
-
-void append_ruby(char *out, size_t out_size, size_t &used, const char *base, const char *reading) {
-    append_text(out, out_size, base);
-    used = strlen(out);
-    if (reading[0] != '\0' && !same_text(reading, base)) {
-        append_char(out, out_size, used, '(');
-        append_limited(out, out_size, used, reading, strlen(reading));
-        append_char(out, out_size, used, ')');
-    }
-}
-
-void render_ruby_plain(const char *input, char *out, size_t out_size) {
-    if (out_size == 0) {
-        return;
-    }
-
-    out[0] = '\0';
-    size_t used = 0;
-    bool in_ruby = false;
-    bool reading_rt = false;
-    char ruby_base[64] = "";
-    char rt_text[64] = "";
-    size_t ruby_used = 0;
-    size_t rt_used = 0;
-    const char *cursor = input;
-
-    while (*cursor != '\0' && used + 1 < out_size) {
-        if (*cursor == '<') {
-            const char *tag_end = strchr(cursor, '>');
-            if (tag_end == nullptr) {
-                break;
-            }
-
-            if (strncmp(cursor, "<rt", 3) == 0) {
-                reading_rt = true;
-            } else if (strncmp(cursor, "</rt", 4) == 0) {
-                reading_rt = false;
-            } else if (strncmp(cursor, "<ruby", 5) == 0) {
-                in_ruby = true;
-                ruby_base[0] = '\0';
-                rt_text[0] = '\0';
-                ruby_used = 0;
-                rt_used = 0;
-            } else if (strncmp(cursor, "</ruby", 6) == 0) {
-                append_ruby(out, out_size, used, ruby_base, rt_text);
-                in_ruby = false;
-                reading_rt = false;
-                ruby_base[0] = '\0';
-                rt_text[0] = '\0';
-                ruby_used = 0;
-                rt_used = 0;
-            }
-
-            cursor = tag_end + 1;
-            continue;
-        }
-
-        if (reading_rt) {
-            append_char(rt_text, sizeof(rt_text), rt_used, *cursor);
-        } else if (in_ruby) {
-            append_char(ruby_base, sizeof(ruby_base), ruby_used, *cursor);
-        } else {
-            out[used++] = *cursor;
-            out[used] = '\0';
-        }
-        cursor++;
-    }
-
-    if (in_ruby) {
-        append_ruby(out, out_size, used, ruby_base, rt_text);
-    }
-}
-
 void strip_ruby_plain(const char *input, char *out, size_t out_size) {
     if (out_size == 0) {
         return;
@@ -480,8 +414,94 @@ void strip_ruby_plain(const char *input, char *out, size_t out_size) {
     }
 }
 
+void extract_ruby_reading(const char *input, char *out, size_t out_size) {
+    if (out_size == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    size_t used = 0;
+    bool reading_rt = false;
+    const char *cursor = input;
+    while (*cursor != '\0' && used + 1 < out_size) {
+        if (*cursor == '<') {
+            const char *tag_end = strchr(cursor, '>');
+            if (tag_end == nullptr) {
+                break;
+            }
+            if (strncmp(cursor, "<rt", 3) == 0) {
+                reading_rt = true;
+            } else if (strncmp(cursor, "</rt", 4) == 0) {
+                reading_rt = false;
+            }
+            cursor = tag_end + 1;
+            continue;
+        }
+        if (reading_rt) {
+            out[used++] = *cursor;
+            out[used] = '\0';
+        }
+        cursor++;
+    }
+}
+
 bool is_selectable_word(const OcrWord &word) {
     return word.definition[0] != '\0' || word.frequency[0] != '\0' || word.kanji[0] != '\0' || word.base[0] != '\0';
+}
+
+void format_selected_word_line(char *line, size_t line_size) {
+    if (line_size == 0) {
+        return;
+    }
+
+    if (g_selected_word < 0 || g_selected_word >= static_cast<int>(g_word_count)) {
+        snprintf(line, line_size, "No definition");
+        return;
+    }
+
+    const OcrWord &word = g_words[g_selected_word];
+    char word_label[320];
+    const char *surface = word.surface_plain[0] != '\0' ? word.surface_plain : word.surface;
+    const char *base = word.base_plain[0] != '\0' ? word.base_plain : surface;
+    if (word.reading[0] != '\0' && strcmp(word.reading, surface) != 0) {
+        snprintf(word_label, sizeof(word_label), "%s(%s)", surface, word.reading);
+    } else {
+        snprintf(word_label, sizeof(word_label), "%s", surface);
+    }
+    if (base[0] != '\0' && strcmp(base, surface) != 0) {
+        append_text(word_label, sizeof(word_label), " [");
+        append_text(word_label, sizeof(word_label), base);
+        append_text(word_label, sizeof(word_label), "]");
+    }
+
+    snprintf(line, line_size, "%s: %s", word_label, word.definition[0] != '\0' ? word.definition : "No definition");
+    if (word.frequency[0] != '\0') {
+        append_text(line, line_size, "  Freq ");
+        append_text(line, line_size, word.frequency);
+    }
+    if (word.kanji[0] != '\0') {
+        append_text(line, line_size, "  ");
+        append_text(line, line_size, word.kanji);
+    }
+}
+
+void write_hud_state() {
+    char state[96];
+    snprintf(
+        state,
+        sizeof(state),
+        "{\"selected\":%d,\"pending\":%s}",
+        g_selected_word,
+        g_ocr_pending.load(std::memory_order_acquire) ? "true" : "false"
+    );
+    write_text(HUD_PATH, state);
+}
+
+void write_target_line() {
+    char line[640];
+    format_selected_word_line(line, sizeof(line));
+    write_text(TARGET_PATH, line);
+    write_hud_state();
 }
 
 void select_first_word() {
@@ -512,6 +532,7 @@ void select_first_word() {
 void move_selection(int delta) {
     if (g_word_count == 0) {
         g_selected_word = -1;
+        write_target_line();
         return;
     }
 
@@ -526,6 +547,7 @@ void move_selection(int delta) {
 
         if (g_words[cursor].selectable) {
             g_selected_word = cursor;
+            write_target_line();
             return;
         }
     }
@@ -560,20 +582,26 @@ bool parse_words_json(const char *json) {
         char raw_surface[SurfaceSize] = "";
         char raw_base[BaseSize] = "";
         char raw_definition[DefinitionSize] = "";
+        char raw_reading[ReadingSize] = "";
         char raw_frequency[FrequencySize] = "";
         char raw_kanji[KanjiSize] = "";
         parse_json_field(object_start, object_end, "w", raw_surface, sizeof(raw_surface));
         parse_json_field(object_start, object_end, "b", raw_base, sizeof(raw_base));
+        parse_json_field(object_start, object_end, "r", raw_reading, sizeof(raw_reading));
         parse_json_field(object_start, object_end, "t", raw_definition, sizeof(raw_definition));
         parse_json_field(object_start, object_end, "f", raw_frequency, sizeof(raw_frequency));
         parse_json_field(object_start, object_end, "k", raw_kanji, sizeof(raw_kanji));
 
         OcrWord &word = g_words[g_word_count];
-        render_ruby_plain(raw_surface, word.surface, sizeof(word.surface));
+        strip_ruby_plain(raw_surface, word.surface, sizeof(word.surface));
         strip_ruby_plain(raw_surface, word.surface_plain, sizeof(word.surface_plain));
-        render_ruby_plain(raw_base, word.base, sizeof(word.base));
+        strip_ruby_plain(raw_base, word.base, sizeof(word.base));
         strip_ruby_plain(raw_base, word.base_plain, sizeof(word.base_plain));
-        render_ruby_plain(raw_definition, word.definition, sizeof(word.definition));
+        strip_ruby_plain(raw_reading, word.reading, sizeof(word.reading));
+        if (word.reading[0] == '\0') {
+            extract_ruby_reading(raw_surface, word.reading, sizeof(word.reading));
+        }
+        strip_ruby_plain(raw_definition, word.definition, sizeof(word.definition));
         copy_text(word.kanji, sizeof(word.kanji), raw_kanji);
         word.frequency_value = -1;
         parse_json_int_field(object_start, object_end, "fv", word.frequency_value);
@@ -593,7 +621,7 @@ bool parse_words_json(const char *json) {
         word.selectable = is_selectable_word(word);
 
         if (word.surface[0] != '\0' || word.base[0] != '\0' || word.definition[0] != '\0') {
-            append_text(g_sentence, sizeof(g_sentence), word.surface[0] != '\0' ? word.surface : word.base);
+            append_text(g_sentence, sizeof(g_sentence), word.surface_plain[0] != '\0' ? word.surface_plain : word.base_plain);
             g_word_count++;
         }
 
@@ -723,6 +751,7 @@ void apply_ocr_response(char *body_text) {
 
     if (parse_words_json(body_text)) {
         write_text(RESULT_PATH, g_sentence);
+        write_target_line();
         set_status("OCR complete. Use D-pad Left/Right.");
         write_text(STATUS_PATH, g_status);
         return;
@@ -735,6 +764,7 @@ void apply_ocr_response(char *body_text) {
         g_word_count = 0;
         g_selected_word = -1;
         write_text(RESULT_PATH, g_sentence);
+        write_text(TARGET_PATH, "No definition");
     }
 
     set_status("OCR complete. No selectable words.");
@@ -767,7 +797,7 @@ size_t expected_http_response_size(const char *response, size_t used) {
     return total_size <= sizeof(g_response) ? total_size : used;
 }
 
-bool request_latest_ocr() {
+bool request_latest_ocr(u32 request_generation) {
     if (!init_socket_driver()) {
         return false;
     }
@@ -793,6 +823,7 @@ bool request_latest_ocr() {
         write_text(STATUS_PATH, g_status);
         return false;
     }
+    g_active_ocr_socket.store(sock, std::memory_order_release);
 
     bool socket_registered = false;
     int register_errno = 0;
@@ -814,6 +845,7 @@ bool request_latest_ocr() {
             socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
         }
         close(sock);
+        g_active_ocr_socket.store(-1, std::memory_order_release);
         set_status("Invalid OCR server IP.");
         write_text(STATUS_PATH, g_status);
         return false;
@@ -836,6 +868,7 @@ bool request_latest_ocr() {
             socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
         }
         close(sock);
+        g_active_ocr_socket.store(-1, std::memory_order_release);
         snprintf(
             g_status,
             sizeof(g_status),
@@ -872,6 +905,7 @@ bool request_latest_ocr() {
             socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
         }
         close(sock);
+        g_active_ocr_socket.store(-1, std::memory_order_release);
         snprintf(g_status, sizeof(g_status), "TCP send failed: errno=%d result=0x%x", errno, socketGetLastResult());
         write_text(STATUS_PATH, g_status);
         return false;
@@ -893,6 +927,7 @@ bool request_latest_ocr() {
                 socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
             }
             close(sock);
+            g_active_ocr_socket.store(-1, std::memory_order_release);
             snprintf(g_status, sizeof(g_status), "TCP receive failed: errno=%d result=0x%x", errno, socketGetLastResult());
             write_text(STATUS_PATH, g_status);
             return false;
@@ -914,6 +949,7 @@ bool request_latest_ocr() {
         socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
     }
     close(sock);
+    g_active_ocr_socket.store(-1, std::memory_order_release);
 
     char *body_text = strstr(g_response, "\r\n\r\n");
     if (body_text == nullptr) {
@@ -923,7 +959,110 @@ bool request_latest_ocr() {
     }
     body_text += 4;
 
+    if (request_generation != g_ocr_generation.load(std::memory_order_acquire)) {
+        return true;
+    }
+
     apply_ocr_response(body_text);
+    return true;
+}
+
+void ocr_worker_entry(void *) {
+    u32 handled_generation = 0;
+    while (g_ocr_thread_running.load(std::memory_order_acquire)) {
+        const u32 desired_generation = g_ocr_generation.load(std::memory_order_acquire);
+        if (desired_generation == handled_generation) {
+            svcSleepThread(OcrWorkerSleepNs);
+            continue;
+        }
+
+        g_ocr_worker_busy.store(true, std::memory_order_release);
+        handled_generation = desired_generation;
+        if (!request_latest_ocr(handled_generation)) {
+            if (handled_generation == g_ocr_generation.load(std::memory_order_acquire)) {
+                g_ocr_pending.store(false, std::memory_order_release);
+                write_text(RESULT_PATH, g_status);
+                write_text(TARGET_PATH, "No definition");
+                write_hud_state();
+            }
+        }
+        if (handled_generation == g_ocr_generation.load(std::memory_order_acquire)) {
+            g_ocr_requested.store(false, std::memory_order_release);
+        } else {
+            set_status("Starting latest OCR request.");
+            write_text(STATUS_PATH, g_status);
+        }
+        g_ocr_worker_busy.store(false, std::memory_order_release);
+    }
+}
+
+bool start_ocr_worker() {
+    if (g_ocr_thread_started) {
+        return true;
+    }
+
+    g_ocr_thread_running.store(true, std::memory_order_release);
+    Result rc = threadCreate(&g_ocr_thread, ocr_worker_entry, nullptr, nullptr, OcrWorkerStackSize, 0x2c, -2);
+    if (R_FAILED(rc)) {
+        g_ocr_thread_running.store(false, std::memory_order_release);
+        snprintf(g_status, sizeof(g_status), "OCR worker thread failed: 0x%x", rc);
+        write_text(STATUS_PATH, g_status);
+        return false;
+    }
+
+    rc = threadStart(&g_ocr_thread);
+    if (R_FAILED(rc)) {
+        threadClose(&g_ocr_thread);
+        g_ocr_thread_running.store(false, std::memory_order_release);
+        snprintf(g_status, sizeof(g_status), "OCR worker start failed: 0x%x", rc);
+        write_text(STATUS_PATH, g_status);
+        return false;
+    }
+
+    g_ocr_thread_started = true;
+    return true;
+}
+
+void stop_ocr_worker() {
+    if (!g_ocr_thread_started) {
+        return;
+    }
+
+    g_ocr_thread_running.store(false, std::memory_order_release);
+    threadWaitForExit(&g_ocr_thread);
+    threadClose(&g_ocr_thread);
+    g_ocr_thread_started = false;
+}
+
+bool queue_ocr_request(const char *source) {
+    if (!g_ocr_thread_started) {
+        set_status("OCR worker unavailable.");
+        write_text(STATUS_PATH, g_status);
+        return false;
+    }
+
+    const bool worker_busy = g_ocr_worker_busy.load(std::memory_order_acquire);
+    const u32 request_generation = g_ocr_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    g_ocr_requested.store(true, std::memory_order_release);
+    g_ocr_pending.store(true, std::memory_order_release);
+    g_word_count = 0;
+    g_selected_word = -1;
+    g_sentence[0] = '\0';
+    write_text(RESULT_PATH, "");
+    write_text(RESULT_JSON_PATH, "");
+    write_text(TARGET_PATH, "Loading...");
+    write_hud_state();
+    g_request_count = request_generation;
+    if (worker_busy) {
+        const int active_socket = g_active_ocr_socket.load(std::memory_order_acquire);
+        if (active_socket >= 0) {
+            shutdown(active_socket, SHUT_RDWR);
+        }
+        snprintf(g_status, sizeof(g_status), "OCR request %u replacing current from %s.", g_request_count, source);
+    } else {
+        snprintf(g_status, sizeof(g_status), "OCR request %u started from %s.", g_request_count, source);
+    }
+    write_text(STATUS_PATH, g_status);
     return true;
 }
 
@@ -1257,25 +1396,8 @@ private:
             return;
         }
 
-        const OcrWord &word = g_words[g_selected_word];
         char line[640];
-        char word_label[320];
-        const char *surface = word.surface_plain[0] != '\0' ? word.surface_plain : word.surface;
-        const char *base = word.base_plain[0] != '\0' ? word.base_plain : surface;
-        if (base[0] != '\0' && strcmp(base, surface) != 0) {
-            snprintf(word_label, sizeof(word_label), "%s [%s]", surface, base);
-        } else {
-            snprintf(word_label, sizeof(word_label), "%s", surface);
-        }
-        snprintf(line, sizeof(line), "%s  %s", word_label, word.definition[0] != '\0' ? word.definition : "No definition");
-        if (word.frequency[0] != '\0') {
-            append_text(line, sizeof(line), "  Freq ");
-            append_text(line, sizeof(line), word.frequency);
-        }
-        if (word.kanji[0] != '\0') {
-            append_text(line, sizeof(line), "  ");
-            append_text(line, sizeof(line), word.kanji);
-        }
+        format_selected_word_line(line, sizeof(line));
         draw_string(line, x + 1, y + 1, 20.0F, Color(0, 0, 0, 15), max_width);
         draw_string(line, x, y, 20.0F, Color(15, 15, 15, 15), max_width);
     }
@@ -1290,7 +1412,7 @@ private:
         s32 cursor_x = x;
         for (size_t i = 0; i < g_word_count; i++) {
             const OcrWord &word = g_words[i];
-            const char *surface = word.surface[0] != '\0' ? word.surface : word.base;
+            const char *surface = word.surface_plain[0] != '\0' ? word.surface_plain : word.base_plain;
             const s32 remaining_width = max_width - (cursor_x - x);
             if (remaining_width <= 0) {
                 break;
@@ -1321,40 +1443,33 @@ HudRenderer g_renderer;
 void poll_request_file() {
     if (read_text(REQUEST_PATH, g_request, sizeof(g_request)) && strcmp(g_request, g_last_request) != 0) {
         copy_text(g_last_request, sizeof(g_last_request), g_request);
-        set_status("OCR request received.");
-        write_text(STATUS_PATH, g_status);
-        g_ocr_pending = true;
-        if (!request_latest_ocr()) {
-            g_ocr_pending = false;
-        }
+        queue_ocr_request("overlay");
     }
 }
 
 void handle_input(u64 keys_down, u64 keys_held) {
-    static u64 last_logged_buttons = 0;
+    static u64 previous_held = 0;
+    static u32 minus_cooldown = 0;
     const u64 interesting_buttons =
         HidNpadButton_Minus | HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_AnyLeft | HidNpadButton_AnyRight;
-    const u64 current_buttons = keys_held & interesting_buttons;
-    if ((keys_down & interesting_buttons) != 0 || current_buttons != last_logged_buttons) {
-        char debug[128];
-        snprintf(debug, sizeof(debug), "Input down=0x%llx held=0x%llx", static_cast<unsigned long long>(keys_down),
-                 static_cast<unsigned long long>(keys_held));
-        write_debug(debug);
-        last_logged_buttons = current_buttons;
+    const u64 current_held = keys_held & interesting_buttons;
+    const bool minus_pressed = ((keys_down | (current_held & ~previous_held)) & HidNpadButton_Minus) != 0;
+    const bool ocr_pending = g_ocr_pending.load(std::memory_order_acquire);
+
+    if (minus_cooldown > 0) {
+        minus_cooldown--;
     }
 
-    if (keys_down & HidNpadButton_Minus) {
-        snprintf(g_status, sizeof(g_status), "OCR request %u: connecting...", ++g_request_count);
-        write_text(STATUS_PATH, g_status);
-        g_ocr_pending = true;
-        if (!request_latest_ocr()) {
-            g_ocr_pending = false;
-        }
-    } else if (keys_down & (HidNpadButton_Left | HidNpadButton_AnyLeft)) {
+    if (minus_pressed && minus_cooldown == 0) {
+        minus_cooldown = MinusCooldownFrames;
+        queue_ocr_request("Minus");
+    } else if (!ocr_pending && (keys_down & (HidNpadButton_Left | HidNpadButton_AnyLeft))) {
         move_selection(-1);
-    } else if (keys_down & (HidNpadButton_Right | HidNpadButton_AnyRight)) {
+    } else if (!ocr_pending && (keys_down & (HidNpadButton_Right | HidNpadButton_AnyRight))) {
         move_selection(1);
     }
+
+    previous_held = current_held;
 }
 
 } // namespace
@@ -1369,6 +1484,7 @@ extern "C" void __appInit(void) {
 }
 
 extern "C" void __appExit(void) {
+    stop_ocr_worker();
     if (g_socket_driver_initialized) {
         socketExit();
     }
@@ -1410,6 +1526,9 @@ int main(int argc, char **argv) {
     mkdir(CONFIG_DIR, 0777);
     set_status("Switch OCR sysmodule polling requests.");
     write_text(STATUS_PATH, g_status);
+    write_text(TARGET_PATH, "No definition");
+    write_hud_state();
+    start_ocr_worker();
 
     PadState pad;
     bool pad_ready = false;
@@ -1436,7 +1555,7 @@ int main(int argc, char **argv) {
             handle_input(padGetButtonsDown(&pad), padGetButtons(&pad));
         }
 
-        if (!renderer_ready) {
+        if (EnableSysmoduleViHud && !renderer_ready) {
             Result rc = g_renderer.init();
             if (R_SUCCEEDED(rc)) {
                 renderer_ready = true;
@@ -1449,11 +1568,11 @@ int main(int argc, char **argv) {
                 write_debug(g_status);
             }
         }
-        if (renderer_ready) {
+        if (EnableSysmoduleViHud && renderer_ready) {
             g_renderer.draw();
         }
 
-        svcSleepThread(50000000);
+        svcSleepThread(InputPollSleepNs);
     }
 
     return 0;

@@ -1030,10 +1030,17 @@ namespace tsl {
 
                 cfg::LayerPosX = 0;
                 cfg::LayerPosY = 0;
+#ifdef TESLA_FULLSCREEN_HUD
+                cfg::FramebufferWidth  = 1280;
+                cfg::FramebufferHeight = 720;
+                cfg::LayerWidth  = cfg::ScreenWidth;
+                cfg::LayerHeight = cfg::ScreenHeight;
+#else
                 cfg::FramebufferWidth  = 448;
                 cfg::FramebufferHeight = 720;
                 cfg::LayerWidth  = cfg::ScreenHeight * (float(cfg::FramebufferWidth) / float(cfg::FramebufferHeight));
                 cfg::LayerHeight = cfg::ScreenHeight;
+#endif
 
                 if (this->m_initialized)
                     return;
@@ -3550,6 +3557,10 @@ namespace tsl {
             }
         }
 
+#ifdef TESLA_AUTO_OPEN_OVERLAY
+        eventFire(&shData.comboEvent);
+        overlay->disableNextAnimation();
+#endif
 
         while (shData.running) {
 
@@ -3558,7 +3569,11 @@ namespace tsl {
             shData.overlayOpen = true;
 
 
+#ifdef TESLA_PASS_THROUGH_INPUT
+            hlp::hidsysEnableAppletToGetInput(true, 0);
+#else
             hlp::requestForeground(true);
+#endif
 
             overlay->show();
             overlay->clearScreen();
@@ -3585,7 +3600,9 @@ namespace tsl {
             overlay->clearScreen();
             overlay->resetFlags();
 
+#ifndef TESLA_PASS_THROUGH_INPUT
             hlp::requestForeground(false);
+#endif
 
             shData.overlayOpen = false;
             eventClear(&shData.comboEvent);
