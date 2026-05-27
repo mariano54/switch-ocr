@@ -52,6 +52,7 @@ overlay-install-reload: overlay-install tools/mtp_put_file
 sysmodule-install: sysmodule-build tools/mtp_put_file
 	tools/mtp_put_file 0x00010001 switch/sysmodule/out/atmosphere/contents/42000000534F4352/exefs.nsp atmosphere/contents/42000000534F4352/exefs.nsp
 	tools/mtp_put_file 0x00010001 switch/sysmodule/out/atmosphere/contents/42000000534F4352/toolbox.json atmosphere/contents/42000000534F4352/toolbox.json
+	tools/mtp_put_file 0x00010001 switch/sysmodule/out/atmosphere/contents/42000000534F4352/flags/boot2.flag atmosphere/contents/42000000534F4352/flags/boot2.flag
 
 sysmodule-enable-boot: tools/mtp_put_file
 	tools/mtp_put_file 0x00010001 tmp/nx_ovlloader_reload_flag.bin atmosphere/contents/42000000534F4352/flags/boot2.flag

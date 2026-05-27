@@ -78,7 +78,7 @@ class SwitchOcrGui final : public tsl::Gui {
 public:
     tsl::elm::Element *createUI() override {
         refreshDisplayFiles();
-        auto *frame = new tsl::elm::OverlayFrame("Switch OCR", "Request OCR");
+        auto *frame = new tsl::elm::OverlayFrame("Switch OCR v3", "A OCR, X close");
         auto *list = new tsl::elm::List();
 
         auto *request = new tsl::elm::ListItem("Transcribe", "A");
@@ -98,14 +98,16 @@ public:
         list->addItem(new tsl::elm::ListItem(g_result));
         list->addItem(new tsl::elm::CategoryHeader("Controls", true));
         list->addItem(new tsl::elm::ListItem("A writes request and closes this overlay"));
-        list->addItem(new tsl::elm::ListItem("Minus hotkey is handled by the sysmodule"));
+        list->addItem(new tsl::elm::ListItem("X closes this overlay"));
+        list->addItem(new tsl::elm::ListItem("Plus closes this Tesla overlay when focused"));
+        list->addItem(new tsl::elm::ListItem("Sysmodule hotkey: Minus OCR"));
 
         frame->setContent(list);
         return frame;
     }
 
     bool handleInput(u64 keysDown, u64, const HidTouchState &, HidAnalogStickState, HidAnalogStickState) override {
-        if (keysDown & HidNpadButton_Plus) {
+        if (keysDown & (HidNpadButton_X | HidNpadButton_Plus)) {
             tsl::Overlay::get()->close();
             return true;
         }

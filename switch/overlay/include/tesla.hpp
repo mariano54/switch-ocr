@@ -3106,6 +3106,11 @@ namespace tsl {
             static elm::TouchEvent touchEvent;
             static u32 repeatTick = 0;
 
+            if (keysDown & (HidNpadButton_X | HidNpadButton_Plus)) {
+                this->close();
+                return;
+            }
+
             auto& currentGui = this->getCurrentGui();
 
             if (currentGui == nullptr)

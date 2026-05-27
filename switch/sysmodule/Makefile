@@ -71,9 +71,10 @@ $(BUILD):
 
 package: $(TARGET).nsp
 	@rm -rf out
-	@mkdir -p out/atmosphere/contents/$(TITLE_ID)
+	@mkdir -p out/atmosphere/contents/$(TITLE_ID)/flags
 	@cp $(TARGET).nsp out/atmosphere/contents/$(TITLE_ID)/exefs.nsp
 	@cp toolbox.json out/atmosphere/contents/$(TITLE_ID)/toolbox.json
+	@: > out/atmosphere/contents/$(TITLE_ID)/flags/boot2.flag
 	@echo "packaged $(TARGET) -> out/atmosphere/contents/$(TITLE_ID)"
 
 clean:

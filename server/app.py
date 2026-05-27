@@ -12,8 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from frame_capture import RollingBridgeCapture, cleanup_capture_artifacts, config_from_env
+from frame_capture import RollingBridgeCapture, capture_bridge_frame, cleanup_capture_artifacts, config_from_env
 from ocr import perform_ocr
+from ocr.formatting import switch_display_text
 
 SERVER_DIR = Path(__file__).resolve().parent
 LAST_OCR_UPLOAD = SERVER_DIR / "last_ocr_upload.jpg"
@@ -23,6 +24,12 @@ UDP_RESPONSE_LIMIT = 12_000
 
 def ocr_latest_payload() -> dict[str, Any]:
     started = time.time()
+    if os.environ.get("SYSDVR_CAPTURE_ON_REQUEST", "1") != "0":
+        try:
+            capture_bridge_frame(LATEST_FRAME, config_from_env())
+        except Exception as exc:
+            print(f"[FrameCapture] on-request capture failed: {exc}", flush=True)
+
     if not LATEST_FRAME.exists():
         return {
             "ok": False,
@@ -64,7 +71,7 @@ def compact_switch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     words = payload.get("words")
     display_text = str(payload.get("display_text", ""))
     if isinstance(words, list) and words:
-        display_text = str(payload.get("text") or display_text.split("\n\n", 1)[0])
+        display_text = switch_display_text(words)
 
     compact: dict[str, Any] = {
         "ok": bool(payload.get("ok")),
@@ -221,7 +228,7 @@ def main() -> None:
 
     cleanup_capture_artifacts(SERVER_DIR)
     capture_worker: RollingBridgeCapture | None = None
-    if not args.no_frame_capture and os.environ.get("SYSDVR_BACKGROUND_CAPTURE", "1") != "0":
+    if not args.no_frame_capture and os.environ.get("SYSDVR_BACKGROUND_CAPTURE", "0") != "0":
         capture_worker = RollingBridgeCapture(
             LATEST_FRAME,
             config_from_env(),

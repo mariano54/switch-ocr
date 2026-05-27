@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import pty
 import signal
+import shutil
 import subprocess
 import threading
 import time
@@ -21,16 +23,18 @@ class FrameCaptureError(RuntimeError):
 class BridgeCaptureConfig:
     switch_ip: str
     client_path: Path = DEFAULT_CLIENT_PATH
-    record_seconds: float = 0.7
-    connect_timeout_seconds: float = 15.0
-    stop_timeout_seconds: float = 8.0
+    record_seconds: float = 8.0
+    connect_timeout_seconds: float = 25.0
+    stop_timeout_seconds: float = 12.0
+    use_pty: bool = False
 
 
 def config_from_env() -> BridgeCaptureConfig:
     return BridgeCaptureConfig(
         switch_ip=os.environ.get("SWITCH_IP", "192.168.0.136"),
         client_path=Path(os.environ.get("SYSDVR_CLIENT", str(DEFAULT_CLIENT_PATH))),
-        record_seconds=float(os.environ.get("SYSDVR_RECORD_SECONDS", "0.7")),
+        record_seconds=float(os.environ.get("SYSDVR_RECORD_SECONDS", "8.0")),
+        use_pty=os.environ.get("SYSDVR_USE_PTY", "0") == "1",
     )
 
 
@@ -77,7 +81,7 @@ class RollingBridgeCapture:
                 print(f"[FrameCapture] {self.last_error}", flush=True)
 
             elapsed = time.monotonic() - started
-            wait_seconds = max(0.1, self.interval_seconds - elapsed)
+            wait_seconds = max(10.0 if self.last_error else 2.0, self.interval_seconds - elapsed)
             self._stop_event.wait(wait_seconds)
 
 
@@ -101,6 +105,7 @@ def capture_bridge_frame(output_path: Path, config: BridgeCaptureConfig) -> None
 
 
 def _record_bridge_clip(video_path: Path, config: BridgeCaptureConfig) -> None:
+    _kill_stale_sysdvr_client(config.client_path)
     command = [
         str(config.client_path),
         "bridge",
@@ -112,18 +117,53 @@ def _record_bridge_clip(video_path: Path, config: BridgeCaptureConfig) -> None:
         "log",
     ]
 
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
     lines: list[str] = []
+    master_fd: int | None = None
+    if config.use_pty:
+        master_fd, slave_fd = pty.openpty()
+        process = subprocess.Popen(
+            command,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            text=True,
+            start_new_session=True,
+        )
+        os.close(slave_fd)
+    else:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
 
     def read_output() -> None:
-        if process.stdout is None:
+        if master_fd is not None:
+            pending = b""
+            try:
+                while True:
+                    chunk = os.read(master_fd, 4096)
+                    if not chunk:
+                        break
+                    pending += chunk
+                    while b"\n" in pending:
+                        raw_line, pending = pending.split(b"\n", 1)
+                        lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\r"))
+            except OSError:
+                pass
+            finally:
+                if pending:
+                    lines.append(pending.decode("utf-8", errors="replace").rstrip("\r"))
+                os.close(master_fd)
             return
-        for line in process.stdout:
+
+        stdout = process.stdout
+        if stdout is None:
+            return
+        for line in stdout:
             lines.append(line.rstrip())
 
     reader = threading.Thread(target=read_output, daemon=True)
@@ -152,9 +192,10 @@ def _record_bridge_clip(video_path: Path, config: BridgeCaptureConfig) -> None:
 
 
 def _extract_latest_frame(video_path: Path, frame_path: Path) -> None:
+    ffmpeg = _find_ffmpeg()
     result = subprocess.run(
         [
-            "ffmpeg",
+            str(ffmpeg),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -180,16 +221,38 @@ def _extract_latest_frame(video_path: Path, frame_path: Path) -> None:
         raise FrameCaptureError(f"Could not extract latest SysDVR frame: {detail}")
 
 
+def _find_ffmpeg() -> Path:
+    found = shutil.which("ffmpeg")
+    if found:
+        return Path(found)
+
+    for candidate in (Path("/opt/homebrew/bin/ffmpeg"), Path("/usr/local/bin/ffmpeg")):
+        if candidate.exists():
+            return candidate
+
+    raise FrameCaptureError("ffmpeg is not installed or not on PATH")
+
+
 def _stop_process(process: subprocess.Popen[str], sig: signal.Signals, timeout_seconds: float) -> None:
     if process.poll() is not None:
         return
 
-    process.send_signal(sig)
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
     try:
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        process.kill()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
         process.wait(timeout=timeout_seconds)
+
+
+def _kill_stale_sysdvr_client(client_path: Path) -> None:
+    subprocess.run(["pkill", "-f", str(client_path)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _summarize_failure(message: str, lines: list[str]) -> str:

@@ -14,11 +14,56 @@ def strip_html(text: str) -> str:
     return TAG_RE.sub("", RT_RE.sub("", text))
 
 
+def _ruby_base(content: str) -> str:
+    return html.unescape(strip_html(RT_RE.sub("", content))).strip()
+
+
+def _ruby_reading(content: str) -> str:
+    return "".join(html.unescape(strip_html(rt)).strip() for rt in RT_RE.findall(content))
+
+
+def _clean_reading(base: str, reading: str) -> str:
+    reading = reading.strip()
+    if reading == base:
+        return ""
+    for left, right in (("(", ")"), ("（", "）")):
+        prefix = f"{base}{left}"
+        if reading.startswith(prefix) and reading.endswith(right):
+            return reading[len(prefix) : -len(right)].strip()
+    if reading.startswith(base):
+        return reading[len(base) :].strip(" ()（）")
+    return reading
+
+
+def _strip_fragment(text: str) -> str:
+    return html.unescape(strip_html(text)).strip()
+
+
+def normalize_ruby_word(text: str) -> str:
+    if "<ruby" not in text.lower():
+        return text
+
+    base = html.unescape(strip_html(RT_RE.sub("", text))).strip()
+    reading_parts: list[str] = []
+    cursor = 0
+    for match in RUBY_RE.finditer(text):
+        reading_parts.append(_strip_fragment(text[cursor : match.start()]))
+        content = match.group(1)
+        reading_parts.append(_ruby_reading(content) or _ruby_base(content))
+        cursor = match.end()
+    reading_parts.append(_strip_fragment(text[cursor:]))
+
+    reading = _clean_reading(base, "".join(reading_parts))
+    if not base or not reading or base == reading:
+        return base
+    return f"<ruby>{html.escape(base)}<rt>{html.escape(reading)}</rt></ruby>"
+
+
 def switch_plain_text(text: str) -> str:
     def replace_ruby(match: re.Match[str]) -> str:
         content = match.group(1)
-        base = html.unescape(strip_html(RT_RE.sub("", content))).strip()
-        reading = "".join(html.unescape(strip_html(rt)).strip() for rt in RT_RE.findall(content))
+        base = _ruby_base(content)
+        reading = _clean_reading(base, _ruby_reading(content))
         if reading and reading != base:
             return f"{base}({reading})"
         return base
@@ -36,8 +81,8 @@ def normalize_words(raw_words: object) -> list[OcrWord]:
             continue
 
         word = {
-            "w": str(item.get("w", "")),
-            "b": str(item.get("b", "")),
+            "w": normalize_ruby_word(str(item.get("w", ""))),
+            "b": normalize_ruby_word(str(item.get("b", ""))),
             "t": str(item.get("t", "")),
         }
         for key in ("f", "fv", "k"):
@@ -54,7 +99,7 @@ def display_text(words: list[OcrWord]) -> str:
 
 
 def switch_display_text(words: list[OcrWord]) -> str:
-    return "".join(switch_plain_text(word.get("w", "")) for word in words)
+    return "".join(switch_plain_text(normalize_ruby_word(word.get("w", ""))) for word in words)
 
 
 def definition_lines(words: list[OcrWord]) -> list[str]:

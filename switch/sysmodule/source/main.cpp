@@ -53,6 +53,7 @@ constexpr u32 FramebufferWidth = 1280;
 constexpr u32 FramebufferHeight = 720;
 constexpr u32 LayerWidth = 1920;
 constexpr u32 LayerHeight = 1080;
+constexpr ViLayerStack ApplicationLayerStack = static_cast<ViLayerStack>(8);
 
 struct OcrWord {
     char surface[SurfaceSize];
@@ -956,6 +957,46 @@ Result add_to_layer_stack(ViLayer *layer, ViLayerStack stack) {
     return serviceDispatchIn(viGetSession_IManagerDisplayService(), 6000, in);
 }
 
+Result set_layer_topmost(ViDisplay *display, ViLayer *layer) {
+    s32 max_z = 0;
+    Result rc = viGetZOrderCountMax(display, &max_z);
+    if (R_FAILED(rc) || max_z <= 0) {
+        return rc;
+    }
+
+    rc = viSetLayerZ(layer, max_z);
+    if (R_FAILED(rc) && max_z > 1) {
+        rc = viSetLayerZ(layer, max_z - 1);
+    }
+    return rc;
+}
+
+Result add_to_visible_layer_stacks(ViLayer *layer) {
+    constexpr ViLayerStack stacks[] = {
+        ViLayerStack_Default,
+        ViLayerStack_Screenshot,
+        ViLayerStack_Recording,
+        ViLayerStack_Arbitrary,
+        ViLayerStack_LastFrame,
+        ViLayerStack_Null,
+        ViLayerStack_ApplicationForDebug,
+        ViLayerStack_Lcd,
+        ApplicationLayerStack,
+    };
+
+    Result first_failure = 0;
+    bool added = false;
+    for (ViLayerStack stack : stacks) {
+        Result rc = add_to_layer_stack(layer, stack);
+        if (R_SUCCEEDED(rc)) {
+            added = true;
+        } else if (R_SUCCEEDED(first_failure)) {
+            first_failure = rc;
+        }
+    }
+    return added ? 0 : first_failure;
+}
+
 class HudRenderer {
 public:
     Result init() {
@@ -987,19 +1028,14 @@ public:
         }
 
         viSetLayerScalingMode(&m_layer, ViScalingMode_FitToLayer);
-        s32 max_z = 0;
-        if (R_SUCCEEDED(viGetZOrderCountMax(&m_display, &max_z)) && max_z > 0) {
-            viSetLayerZ(&m_layer, max_z);
+        Result stack_rc = add_to_visible_layer_stacks(&m_layer);
+        if (R_FAILED(stack_rc)) {
+            return stack_rc;
         }
-
-        add_to_layer_stack(&m_layer, ViLayerStack_Default);
-        add_to_layer_stack(&m_layer, ViLayerStack_Screenshot);
-        add_to_layer_stack(&m_layer, ViLayerStack_Recording);
-        add_to_layer_stack(&m_layer, ViLayerStack_Arbitrary);
-        add_to_layer_stack(&m_layer, ViLayerStack_LastFrame);
-        add_to_layer_stack(&m_layer, ViLayerStack_Null);
-        add_to_layer_stack(&m_layer, ViLayerStack_ApplicationForDebug);
-        add_to_layer_stack(&m_layer, ViLayerStack_Lcd);
+        rc = set_layer_topmost(&m_display, &m_layer);
+        if (R_FAILED(rc)) {
+            return rc;
+        }
 
         rc = viSetLayerSize(&m_layer, LayerWidth, LayerHeight);
         if (R_FAILED(rc)) {
