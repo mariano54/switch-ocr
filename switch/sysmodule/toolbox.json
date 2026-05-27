@@ -1,0 +1,5 @@
+{
+    "name": "Switch OCR Sysmodule",
+    "tid": "42000000534F4352",
+    "requires_reboot": true
+}
