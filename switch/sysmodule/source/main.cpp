@@ -999,7 +999,7 @@ public:
         add_to_layer_stack(&m_layer, ViLayerStack_ApplicationForDebug);
         add_to_layer_stack(&m_layer, ViLayerStack_Lcd);
 
-        rc = viSetLayerSize(&m_layer, 1920, 1080);
+        rc = viSetLayerSize(&m_layer, FramebufferWidth, FramebufferHeight);
         if (R_FAILED(rc)) {
             return rc;
         }
@@ -1045,7 +1045,7 @@ public:
         constexpr s32 panel_h = 100;
         constexpr s32 panel_y = FramebufferHeight - panel_h;
         constexpr s32 panel_w = FramebufferWidth;
-        draw_rect(panel_x, panel_y, panel_w, panel_h, Color(0, 0, 0, 5));
+        draw_rect(panel_x, panel_y, panel_w, panel_h, Color(0, 0, 0, 10));
 
         if (!m_font_ready) {
             draw_rect(panel_x + 14, panel_y + 24, 520, 20, Color(15, 15, 15, 15));
@@ -1205,23 +1205,26 @@ private:
             const char *dots[] = {".", "..", "..."};
             char message[160];
             snprintf(message, sizeof(message), "OCR pending%s", dots[(g_loading_frame++ / 8) % 3]);
+            draw_string(message, x + 1, y + 1, 22.0F, Color(0, 0, 0, 15), max_width);
             draw_string(message, x, y, 22.0F, Color(0, 15, 13, 15), max_width);
             return;
         }
 
         if (g_selected_word < 0 || g_selected_word >= static_cast<int>(g_word_count)) {
-            draw_string("No definition", x, y, 22.0F, Color(10, 10, 10, 15), max_width);
+            draw_string("No definition", x + 1, y + 1, 22.0F, Color(0, 0, 0, 15), max_width);
+            draw_string("No definition", x, y, 22.0F, Color(13, 13, 13, 15), max_width);
             return;
         }
 
         const OcrWord &word = g_words[g_selected_word];
         const Color word_color(0, 15, 13, 15);
         const Color definition_color(15, 15, 15, 15);
-        const Color meta_color(9, 9, 9, 15);
+        const Color meta_color(12, 12, 12, 15);
         s32 x_cursor = x;
         auto draw_segment = [&](const char *text, Color color) {
             const s32 remaining_width = max_width - (x_cursor - x);
             if (remaining_width > 0) {
+                draw_string(text, x_cursor + 1, y + 1, 22.0F, Color(0, 0, 0, 15), remaining_width);
                 x_cursor = draw_string(text, x_cursor, y, 22.0F, color, remaining_width);
             }
         };
@@ -1250,6 +1253,7 @@ private:
 
     void draw_words_line(s32 x, s32 y, float font_size, s32 max_width) {
         if (g_word_count == 0) {
+            draw_string(g_sentence, x + 1, y + 1, font_size, Color(0, 0, 0, 15), max_width);
             draw_string(g_sentence, x, y, font_size, Color(15, 15, 15, 15), max_width);
             return;
         }
@@ -1265,8 +1269,9 @@ private:
 
             const s32 width = text_width(surface, font_size, remaining_width);
             if (static_cast<int>(i) == g_selected_word && width > 0) {
-                draw_rect(cursor_x - 2, y - 22, width + 4, 28, Color(0, 15, 13, 7));
+                draw_rect(cursor_x - 2, y - 22, width + 4, 28, Color(0, 15, 13, 9));
             }
+            draw_string(surface, cursor_x + 1, y + 1, font_size, Color(0, 0, 0, 15), remaining_width);
             cursor_x = draw_string(surface, cursor_x, y, font_size, Color(15, 15, 15, 15), remaining_width);
         }
     }
