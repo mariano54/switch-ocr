@@ -51,6 +51,8 @@ constexpr size_t SentenceSize = 2048;
 constexpr size_t ResponseSize = 16384;
 constexpr u32 FramebufferWidth = 1280;
 constexpr u32 FramebufferHeight = 720;
+constexpr u32 LayerWidth = 1920;
+constexpr u32 LayerHeight = 1080;
 
 struct OcrWord {
     char surface[SurfaceSize];
@@ -999,7 +1001,7 @@ public:
         add_to_layer_stack(&m_layer, ViLayerStack_ApplicationForDebug);
         add_to_layer_stack(&m_layer, ViLayerStack_Lcd);
 
-        rc = viSetLayerSize(&m_layer, FramebufferWidth, FramebufferHeight);
+        rc = viSetLayerSize(&m_layer, LayerWidth, LayerHeight);
         if (R_FAILED(rc)) {
             return rc;
         }
@@ -1045,7 +1047,8 @@ public:
         constexpr s32 panel_h = 100;
         constexpr s32 panel_y = FramebufferHeight - panel_h;
         constexpr s32 panel_w = FramebufferWidth;
-        draw_rect(panel_x, panel_y, panel_w, panel_h, Color(0, 0, 0, 10));
+        draw_rect(panel_x, panel_y, panel_w, panel_h, Color(0, 0, 0, 14));
+        draw_rect(panel_x, panel_y, 16, panel_h, Color(0, 15, 13, 15));
 
         if (!m_font_ready) {
             draw_rect(panel_x + 14, panel_y + 24, 520, 20, Color(15, 15, 15, 15));
@@ -1295,7 +1298,6 @@ void poll_request_file() {
         set_status("OCR request received.");
         write_text(STATUS_PATH, g_status);
         g_ocr_pending = true;
-        g_renderer.draw();
         if (!request_latest_ocr()) {
             g_ocr_pending = false;
         }
@@ -1319,7 +1321,6 @@ void handle_input(u64 keys_down, u64 keys_held) {
         snprintf(g_status, sizeof(g_status), "OCR request %u: connecting...", ++g_request_count);
         write_text(STATUS_PATH, g_status);
         g_ocr_pending = true;
-        g_renderer.draw();
         if (!request_latest_ocr()) {
             g_ocr_pending = false;
         }

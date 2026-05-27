@@ -9,19 +9,12 @@
 #define REQUEST_PATH CONFIG_DIR "/request.txt"
 #define RESULT_PATH CONFIG_DIR "/result.txt"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
-#define DEBUG_PATH CONFIG_DIR "/debug.txt"
 
 namespace {
 
 char g_status[512] = "Sysmodule HUD not seen yet. Reboot after installing it.";
 char g_result[1024] = "No OCR result yet.";
-char g_debug[512] = "No HUD debug yet.";
 bool g_sd_mounted = false;
-int g_poll_ticks = 0;
-tsl::elm::ListItem *g_status_item = nullptr;
-tsl::elm::ListItem *g_result_item = nullptr;
-tsl::elm::ListItem *g_debug_item = nullptr;
-tsl::elm::ListItem *g_request_item = nullptr;
 
 void copyText(char *out, size_t outSize, const char *text) {
     if (outSize == 0) {
@@ -69,23 +62,6 @@ void refreshDisplayFiles() {
     if (readText(RESULT_PATH, result, sizeof(result))) {
         copyText(g_result, sizeof(g_result), result);
     }
-    char debug[sizeof(g_debug)];
-    if (readText(DEBUG_PATH, debug, sizeof(debug))) {
-        copyText(g_debug, sizeof(g_debug), debug);
-    }
-
-    if (g_status_item != nullptr) {
-        g_status_item->setText(g_status);
-        g_status_item->invalidate();
-    }
-    if (g_result_item != nullptr) {
-        g_result_item->setText(g_result);
-        g_result_item->invalidate();
-    }
-    if (g_debug_item != nullptr) {
-        g_debug_item->setText(g_debug);
-        g_debug_item->invalidate();
-    }
 }
 
 void sendOcrRequest() {
@@ -94,66 +70,38 @@ void sendOcrRequest() {
     writeText(REQUEST_PATH, request);
     copyText(g_status, sizeof(g_status), "Overlay sent OCR request. Waiting for sysmodule...");
     writeText(STATUS_PATH, g_status);
-    if (g_status_item != nullptr) {
-        g_status_item->setText(g_status);
-        g_status_item->invalidate();
-    }
-    if (g_request_item != nullptr) {
-        g_request_item->setValue("sent");
-        g_request_item->invalidate();
-    }
 }
 
 } // namespace
 
 class SwitchOcrGui final : public tsl::Gui {
 public:
-    ~SwitchOcrGui() override {
-        g_status_item = nullptr;
-        g_result_item = nullptr;
-        g_debug_item = nullptr;
-        g_request_item = nullptr;
-    }
-
     tsl::elm::Element *createUI() override {
         refreshDisplayFiles();
-        auto *frame = new tsl::elm::OverlayFrame("Switch OCR", "Manual test panel");
+        auto *frame = new tsl::elm::OverlayFrame("Switch OCR", "Request OCR");
         auto *list = new tsl::elm::List();
 
-        auto *request = new tsl::elm::ListItem("Send OCR request", "A");
+        auto *request = new tsl::elm::ListItem("Transcribe", "A");
         request->setClickListener([](u64 keys) {
             if (keys & HidNpadButton_A) {
                 sendOcrRequest();
+                tsl::Overlay::get()->close();
                 return true;
             }
             return false;
         });
-        g_request_item = request;
         list->addItem(request);
 
-        g_status_item = new tsl::elm::ListItem(g_status);
         list->addItem(new tsl::elm::CategoryHeader("Sysmodule status", true));
-        list->addItem(g_status_item);
-        g_result_item = new tsl::elm::ListItem(g_result);
+        list->addItem(new tsl::elm::ListItem(g_status));
         list->addItem(new tsl::elm::CategoryHeader("Latest OCR result", true));
-        list->addItem(g_result_item);
-        g_debug_item = new tsl::elm::ListItem(g_debug);
-        list->addItem(new tsl::elm::CategoryHeader("HUD/input debug", true));
-        list->addItem(g_debug_item);
-        refreshDisplayFiles();
+        list->addItem(new tsl::elm::ListItem(g_result));
         list->addItem(new tsl::elm::CategoryHeader("Controls", true));
-        list->addItem(new tsl::elm::ListItem("Minus hotkey is still handled by sysmodule"));
-        list->addItem(new tsl::elm::ListItem("Tesla hotkey", "LS"));
+        list->addItem(new tsl::elm::ListItem("A writes request and closes this overlay"));
+        list->addItem(new tsl::elm::ListItem("Minus hotkey is handled by the sysmodule"));
 
         frame->setContent(list);
         return frame;
-    }
-
-    void update() override {
-        if (++g_poll_ticks >= 5) {
-            g_poll_ticks = 0;
-            refreshDisplayFiles();
-        }
     }
 
     bool handleInput(u64 keysDown, u64, const HidTouchState &, HidAnalogStickState, HidAnalogStickState) override {
@@ -178,10 +126,6 @@ public:
     }
 
     void exitServices() override {
-        g_status_item = nullptr;
-        g_result_item = nullptr;
-        g_debug_item = nullptr;
-        g_request_item = nullptr;
         if (g_sd_mounted) {
             fsdevUnmountDevice("sdmc");
             g_sd_mounted = false;
