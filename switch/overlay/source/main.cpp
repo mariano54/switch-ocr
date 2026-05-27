@@ -1,5 +1,4 @@
 #define TESLA_INIT_IMPL
-#define TESLA_AUTO_OPEN_OVERLAY
 #define TESLA_FULLSCREEN_HUD
 #define TESLA_PASS_THROUGH_INPUT
 #include <tesla.hpp>
@@ -44,7 +43,9 @@ char g_status[512] = "Done";
 char g_result[SentenceSize] = "No OCR result yet.";
 char g_target[1024] = "No selected word yet.";
 char g_result_json[ResultJsonSize] = "";
-char g_hud_json[256] = "";
+char g_hud_json[512] = "";
+char g_hud_frequency[FrequencySize] = "";
+char g_hud_kanji[KanjiSize] = "";
 OcrWord g_words[MaxWords] = {};
 size_t g_word_count = 0;
 int g_selected_word = -1;
@@ -95,25 +96,6 @@ bool readText(const char *path, char *out, size_t outSize) {
         out[--size] = '\0';
     }
     return size > 0;
-}
-
-void writeText(const char *path, const char *text) {
-    if (!g_sd_mounted) {
-        return;
-    }
-
-    FILE *file = fopen(path, "w");
-    if (file == nullptr) {
-        return;
-    }
-    fputs(text, file);
-    fclose(file);
-}
-
-void requestOcrOnOpen() {
-    char request[64];
-    snprintf(request, sizeof(request), "overlay-open %llu", static_cast<unsigned long long>(svcGetSystemTick()));
-    writeText(REQUEST_PATH, request);
 }
 
 bool isWhitespace(char value) {
@@ -347,7 +329,7 @@ int defaultSelectedWord(const OcrWord *words, size_t wordCount) {
     int selected = -1;
     int bestFrequencyValue = -1;
     for (size_t i = 0; i < wordCount; i++) {
-        if (words[i].frequency_value > bestFrequencyValue) {
+        if (words[i].frequency_value >= 0 && words[i].frequency_value > bestFrequencyValue) {
             bestFrequencyValue = words[i].frequency_value;
             selected = static_cast<int>(i);
         }
@@ -427,12 +409,20 @@ bool parseWordsJson(const char *json) {
         if (word.frequency_value >= 0) {
             snprintf(word.frequency, sizeof(word.frequency), "%d", word.frequency_value);
         } else {
+            word.frequency[0] = '\0';
             size_t frequencyUsed = 0;
             for (const char *frequency = rawFrequency; *frequency != '\0' && frequencyUsed + 1 < sizeof(word.frequency); frequency++) {
                 if (*frequency >= '0' && *frequency <= '9') {
                     appendChar(word.frequency, sizeof(word.frequency), frequencyUsed, *frequency);
                 } else if (frequencyUsed > 0) {
                     break;
+                }
+            }
+            if (frequencyUsed > 0) {
+                char *end = nullptr;
+                const long parsedFrequency = strtol(word.frequency, &end, 10);
+                if (end != word.frequency && parsedFrequency >= 0) {
+                    word.frequency_value = static_cast<int>(parsedFrequency);
                 }
             }
         }
@@ -467,8 +457,16 @@ bool parseWordsJson(const char *json) {
 void parseHudJson(const char *json) {
     const char *end = json + strlen(json);
     int selected = -1;
+    bool hasSelected = false;
     if (parseJsonIntField(json, end, "selected", selected)) {
+        hasSelected = true;
         g_selected_word = (selected >= 0 && selected < static_cast<int>(g_word_count)) ? selected : -1;
+    }
+    g_hud_frequency[0] = '\0';
+    g_hud_kanji[0] = '\0';
+    if (!hasSelected || g_selected_word >= 0) {
+        parseJsonField(json, end, "f", g_hud_frequency, sizeof(g_hud_frequency));
+        parseJsonField(json, end, "k", g_hud_kanji, sizeof(g_hud_kanji));
     }
     bool pending = false;
     if (parseJsonBoolField(json, end, "pending", pending)) {
@@ -491,8 +489,10 @@ void refreshDisplayFiles() {
     }
     char resultJson[sizeof(g_result_json)];
     if (readText(RESULT_JSON_PATH, resultJson, sizeof(resultJson))) {
-        copyText(g_result_json, sizeof(g_result_json), resultJson);
-        parseWordsJson(g_result_json);
+        if (strcmp(resultJson, g_result_json) != 0 || g_word_count == 0) {
+            copyText(g_result_json, sizeof(g_result_json), resultJson);
+            parseWordsJson(g_result_json);
+        }
     }
     char hudJson[sizeof(g_hud_json)];
     if (readText(HUD_PATH, hudJson, sizeof(hudJson))) {
@@ -709,15 +709,17 @@ public:
 
         void formatMeta(const OcrWord &word, char *out, size_t outSize) {
             out[0] = '\0';
-            if (word.frequency[0] != '\0') {
+            const char *frequency = g_hud_frequency[0] != '\0' ? g_hud_frequency : word.frequency;
+            const char *kanji = g_hud_kanji[0] != '\0' ? g_hud_kanji : word.kanji;
+            if (frequency[0] != '\0') {
                 appendText(out, outSize, "Freq ");
-                appendText(out, outSize, word.frequency);
+                appendText(out, outSize, frequency);
             }
-            if (word.kanji[0] != '\0') {
+            if (kanji[0] != '\0') {
                 if (out[0] != '\0') {
                     appendText(out, outSize, "   ");
                 }
-                appendText(out, outSize, word.kanji);
+                appendText(out, outSize, kanji);
             }
         }
 
@@ -740,13 +742,14 @@ public:
 
             constexpr float statusSize = 11.0F;
             constexpr float metaSize = 12.0F;
-            s32 metaWidth = measureText(renderer, meta, metaSize);
-            const s32 maxMetaWidth = 420;
-            if (metaWidth > maxMetaWidth) {
-                metaWidth = maxMetaWidth;
-            }
             const s32 rightEdge = x + maxWidth;
-            const s32 metaX = meta[0] != '\0' ? rightEdge - metaWidth : rightEdge;
+            const s32 metaAreaX = meta[0] != '\0' ? x + (maxWidth * 2 / 3) : rightEdge;
+            const s32 metaMaxWidth = rightEdge - metaAreaX;
+            s32 metaWidth = measureText(renderer, meta, metaSize);
+            if (metaWidth > metaMaxWidth) {
+                metaWidth = metaMaxWidth;
+            }
+            const s32 metaX = meta[0] != '\0' ? metaAreaX : rightEdge;
             const s32 statusWidth = measureText(renderer, status, statusSize);
             const s32 statusX = (meta[0] != '\0' ? metaX : rightEdge) - statusWidth - 16;
             const tsl::Color statusColor = strcmp(status, "Error") == 0 ? tsl::Color(15, 5, 4, 15)
@@ -754,12 +757,12 @@ public:
                                                                    : tsl::Color(10, 10, 10, 15);
             drawText(renderer, status, statusX, y, statusSize, statusColor, statusWidth + 4, false);
             if (meta[0] != '\0') {
-                drawText(renderer, meta, metaX, y, metaSize, tsl::Color(10, 10, 10, 15), metaWidth, false);
+                drawText(renderer, meta, metaX, y, metaSize, tsl::Color(11, 11, 11, 15), metaWidth);
             }
 
             s32 leftMax = statusX - x - 14;
             if (leftMax < 420) {
-                leftMax = maxWidth - 470;
+                leftMax = meta[0] != '\0' ? metaX - x - 18 : maxWidth - 70;
             }
             if (leftMax <= 0) {
                 return;
@@ -832,10 +835,6 @@ public:
             fsdevUnmountDevice("sdmc");
             g_sd_mounted = false;
         }
-    }
-
-    void onShow() override {
-        requestOcrOnOpen();
     }
 
     std::unique_ptr<tsl::Gui> loadInitialGui() override {

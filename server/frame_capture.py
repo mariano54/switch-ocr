@@ -13,8 +13,10 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CLIENT_PATH = ROOT_DIR / "tmp" / "sysdvr-client" / "mac-arm64" / "SysDVR-Client"
-DEFAULT_RECORD_SECONDS = 0.6
-DEFAULT_CAPTURE_RETRIES = 2
+DEFAULT_RECORD_SECONDS = 0.85
+DEFAULT_CAPTURE_RETRIES = 3
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.5
+DEFAULT_STOP_TIMEOUT_SECONDS = 8.0
 
 
 class FrameCaptureError(RuntimeError):
@@ -27,8 +29,8 @@ class BridgeCaptureConfig:
     client_path: Path = DEFAULT_CLIENT_PATH
     record_seconds: float = DEFAULT_RECORD_SECONDS
     capture_retries: int = DEFAULT_CAPTURE_RETRIES
-    connect_timeout_seconds: float = 25.0
-    stop_timeout_seconds: float = 12.0
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    stop_timeout_seconds: float = DEFAULT_STOP_TIMEOUT_SECONDS
     use_pty: bool = False
 
 
@@ -38,6 +40,8 @@ def config_from_env() -> BridgeCaptureConfig:
         client_path=Path(os.environ.get("SYSDVR_CLIENT", str(DEFAULT_CLIENT_PATH))),
         record_seconds=float(os.environ.get("SYSDVR_RECORD_SECONDS", str(DEFAULT_RECORD_SECONDS))),
         capture_retries=int(os.environ.get("SYSDVR_CAPTURE_RETRIES", str(DEFAULT_CAPTURE_RETRIES))),
+        connect_timeout_seconds=float(os.environ.get("SYSDVR_CONNECT_TIMEOUT_SECONDS", str(DEFAULT_CONNECT_TIMEOUT_SECONDS))),
+        stop_timeout_seconds=float(os.environ.get("SYSDVR_STOP_TIMEOUT_SECONDS", str(DEFAULT_STOP_TIMEOUT_SECONDS))),
         use_pty=os.environ.get("SYSDVR_USE_PTY", "0") == "1",
     )
 

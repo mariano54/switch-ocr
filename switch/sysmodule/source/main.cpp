@@ -60,6 +60,7 @@ constexpr u32 LayerHeight = 1080;
 constexpr size_t OcrWorkerStackSize = 0x8000;
 constexpr u64 OcrWorkerSleepNs = 50000000;
 constexpr u64 InputPollSleepNs = 20000000;
+constexpr u64 OcrRequestTimeoutNs = 20000000000ULL;
 constexpr u32 MinusCooldownFrames = 12;
 constexpr ViLayerStack ApplicationLayerStack = static_cast<ViLayerStack>(8);
 constexpr bool EnableSysmoduleViHud = false;
@@ -117,6 +118,8 @@ std::atomic_bool g_ocr_requested = false;
 std::atomic_bool g_ocr_worker_busy = false;
 std::atomic_bool g_ocr_thread_running = false;
 std::atomic<u32> g_ocr_generation = 0;
+std::atomic<u32> g_ocr_timeout_generation = 0;
+std::atomic<u64> g_ocr_started_tick = 0;
 std::atomic_int g_active_ocr_socket = -1;
 bool g_ocr_thread_started = false;
 Thread g_ocr_thread = {};
@@ -140,6 +143,57 @@ bool append_text(char *out, size_t out_size, const char *text) {
     }
     snprintf(out + used, out_size - used, "%s", text != nullptr ? text : "");
     return true;
+}
+
+bool append_json_escaped(char *out, size_t out_size, const char *text) {
+    size_t used = strlen(out);
+    for (const char *cursor = text != nullptr ? text : ""; *cursor != '\0'; cursor++) {
+        const char ch = *cursor;
+        const char *escaped = nullptr;
+        switch (ch) {
+            case '"':
+                escaped = "\\\"";
+                break;
+            case '\\':
+                escaped = "\\\\";
+                break;
+            case '\n':
+                escaped = "\\n";
+                break;
+            case '\r':
+                escaped = "\\r";
+                break;
+            case '\t':
+                escaped = "\\t";
+                break;
+            default:
+                break;
+        }
+
+        if (escaped != nullptr) {
+            const size_t length = strlen(escaped);
+            if (used + length >= out_size) {
+                return false;
+            }
+            memcpy(out + used, escaped, length);
+            used += length;
+        } else {
+            if (used + 1 >= out_size) {
+                return false;
+            }
+            out[used++] = ch;
+        }
+        out[used] = '\0';
+    }
+    return true;
+}
+
+void copy_json_escaped(char *out, size_t out_size, const char *text) {
+    if (out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    append_json_escaped(out, out_size, text);
 }
 
 void write_text(const char *path, const char *text) {
@@ -486,13 +540,21 @@ void format_selected_word_line(char *line, size_t line_size) {
 }
 
 void write_hud_state() {
-    char state[96];
+    const OcrWord *word = (g_selected_word >= 0 && g_selected_word < static_cast<int>(g_word_count)) ? &g_words[g_selected_word] : nullptr;
+    char frequency[FrequencySize * 2];
+    char kanji[KanjiSize * 2];
+    copy_json_escaped(frequency, sizeof(frequency), word != nullptr ? word->frequency : "");
+    copy_json_escaped(kanji, sizeof(kanji), word != nullptr ? word->kanji : "");
+
+    char state[384];
     snprintf(
         state,
         sizeof(state),
-        "{\"selected\":%d,\"pending\":%s}",
+        "{\"selected\":%d,\"pending\":%s,\"f\":\"%s\",\"k\":\"%s\"}",
         g_selected_word,
-        g_ocr_pending.load(std::memory_order_acquire) ? "true" : "false"
+        g_ocr_pending.load(std::memory_order_acquire) ? "true" : "false",
+        frequency,
+        kanji
     );
     write_text(HUD_PATH, state);
 }
@@ -504,11 +566,29 @@ void write_target_line() {
     write_hud_state();
 }
 
+void set_ocr_error_state(const char *status, const char *result) {
+    char status_copy[sizeof(g_status)];
+    char result_copy[SentenceSize];
+    copy_text(status_copy, sizeof(status_copy), status);
+    copy_text(result_copy, sizeof(result_copy), result);
+    g_ocr_pending.store(false, std::memory_order_release);
+    g_ocr_requested.store(false, std::memory_order_release);
+    g_ocr_started_tick.store(0, std::memory_order_release);
+    g_word_count = 0;
+    g_selected_word = -1;
+    copy_text(g_sentence, sizeof(g_sentence), result_copy);
+    write_text(RESULT_PATH, g_sentence);
+    write_text(TARGET_PATH, "No definition");
+    set_status(status_copy);
+    write_text(STATUS_PATH, g_status);
+    write_hud_state();
+}
+
 void select_first_word() {
     g_selected_word = -1;
     int best_frequency_value = -1;
     for (size_t i = 0; i < g_word_count; i++) {
-        if (g_words[i].frequency_value > best_frequency_value) {
+        if (g_words[i].frequency_value >= 0 && g_words[i].frequency_value > best_frequency_value) {
             best_frequency_value = g_words[i].frequency_value;
             g_selected_word = static_cast<int>(i);
         }
@@ -617,6 +697,13 @@ bool parse_words_json(const char *json) {
                     break;
                 }
             }
+            if (frequency_used > 0) {
+                char *end = nullptr;
+                const long parsed_frequency = strtol(word.frequency, &end, 10);
+                if (end != word.frequency && parsed_frequency >= 0) {
+                    word.frequency_value = static_cast<int>(parsed_frequency);
+                }
+            }
         }
         word.selectable = is_selectable_word(word);
 
@@ -650,6 +737,90 @@ bool copy_json_string(const char *json, const char *key, char *out, size_t out_s
     cursor++;
     skip_whitespace(cursor, end);
     return parse_json_string(cursor, end, out, out_size) != nullptr;
+}
+
+bool copy_json_error_text(const char *json, char *out, size_t out_size) {
+    if (copy_json_string(json, "display_text", out, out_size) || copy_json_string(json, "error", out, out_size)) {
+        return true;
+    }
+    copy_text(out, out_size, "Mac OCR request failed.");
+    return false;
+}
+
+bool parse_json_bool_field(const char *json, const char *key, bool &out) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+
+    const char *cursor = strstr(json, pattern);
+    if (cursor == nullptr) {
+        return false;
+    }
+
+    const char *end = json + strlen(json);
+    cursor += strlen(pattern);
+    skip_whitespace(cursor, end);
+    if (cursor >= end || *cursor != ':') {
+        return false;
+    }
+    cursor++;
+    skip_whitespace(cursor, end);
+    if (cursor + 4 <= end && strncmp(cursor, "true", 4) == 0) {
+        out = true;
+        return true;
+    }
+    if (cursor + 5 <= end && strncmp(cursor, "false", 5) == 0) {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+bool response_reports_failure(const char *json) {
+    bool value = true;
+    return (parse_json_bool_field(json, "ok", value) && !value) ||
+           (parse_json_bool_field(json, "success", value) && !value);
+}
+
+bool ocr_generation_timed_out(u32 generation) {
+    return generation != 0 && g_ocr_timeout_generation.load(std::memory_order_acquire) == generation;
+}
+
+bool ocr_generation_expired(u32 generation) {
+    if (generation == 0 || generation != g_ocr_generation.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const u64 started_tick = g_ocr_started_tick.load(std::memory_order_acquire);
+    return started_tick != 0 && armTicksToNs(svcGetSystemTick() - started_tick) >= OcrRequestTimeoutNs;
+}
+
+void mark_ocr_timeout(u32 generation) {
+    if (!g_ocr_pending.load(std::memory_order_acquire) || !ocr_generation_expired(generation)) {
+        return;
+    }
+    g_ocr_timeout_generation.store(generation, std::memory_order_release);
+    set_ocr_error_state("OCR timed out after 20s.", "OCR request timed out after 20 seconds.");
+    const int active_socket = g_active_ocr_socket.load(std::memory_order_acquire);
+    if (active_socket >= 0) {
+        shutdown(active_socket, SHUT_RDWR);
+    }
+}
+
+void poll_ocr_timeout() {
+    if (!g_ocr_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    const u32 generation = g_ocr_generation.load(std::memory_order_acquire);
+    if (!ocr_generation_timed_out(generation)) {
+        mark_ocr_timeout(generation);
+    }
+}
+
+int parse_http_status(const char *response) {
+    if (strncmp(response, "HTTP/", 5) != 0) {
+        return 0;
+    }
+    const char *space = strchr(response, ' ');
+    return space != nullptr ? static_cast<int>(strtol(space + 1, nullptr, 10)) : 0;
 }
 
 bool init_socket_driver() {
@@ -746,8 +917,17 @@ bool wait_for_tcp_connection(int sock) {
 }
 
 void apply_ocr_response(char *body_text) {
-    g_ocr_pending = false;
+    g_ocr_pending.store(false, std::memory_order_release);
+    g_ocr_requested.store(false, std::memory_order_release);
+    g_ocr_started_tick.store(0, std::memory_order_release);
     write_text(RESULT_JSON_PATH, body_text);
+
+    if (response_reports_failure(body_text)) {
+        char display_text[SentenceSize];
+        copy_json_error_text(body_text, display_text, sizeof(display_text));
+        set_ocr_error_state("OCR request failed.", display_text);
+        return;
+    }
 
     if (parse_words_json(body_text)) {
         write_text(RESULT_PATH, g_sentence);
@@ -765,10 +945,13 @@ void apply_ocr_response(char *body_text) {
         g_selected_word = -1;
         write_text(RESULT_PATH, g_sentence);
         write_text(TARGET_PATH, "No definition");
+        write_hud_state();
+        set_status("OCR complete. No selectable words.");
+        write_text(STATUS_PATH, g_status);
+        return;
     }
 
-    set_status("OCR complete. No selectable words.");
-    write_text(STATUS_PATH, g_status);
+    set_ocr_error_state("Invalid OCR response from Mac.", "Invalid OCR response from Mac.");
 }
 
 size_t expected_http_response_size(const char *response, size_t used) {
@@ -962,6 +1145,21 @@ bool request_latest_ocr(u32 request_generation) {
     if (request_generation != g_ocr_generation.load(std::memory_order_acquire)) {
         return true;
     }
+    if (ocr_generation_timed_out(request_generation) || ocr_generation_expired(request_generation)) {
+        mark_ocr_timeout(request_generation);
+        return false;
+    }
+
+    const int http_status = parse_http_status(g_response);
+    if (http_status < 200 || http_status >= 300) {
+        char display_text[SentenceSize];
+        char status[128];
+        copy_json_error_text(body_text, display_text, sizeof(display_text));
+        snprintf(status, sizeof(status), "OCR request failed: HTTP %d.", http_status);
+        write_text(RESULT_JSON_PATH, body_text);
+        set_ocr_error_state(status, display_text);
+        return true;
+    }
 
     apply_ocr_response(body_text);
     return true;
@@ -980,10 +1178,11 @@ void ocr_worker_entry(void *) {
         handled_generation = desired_generation;
         if (!request_latest_ocr(handled_generation)) {
             if (handled_generation == g_ocr_generation.load(std::memory_order_acquire)) {
-                g_ocr_pending.store(false, std::memory_order_release);
-                write_text(RESULT_PATH, g_status);
-                write_text(TARGET_PATH, "No definition");
-                write_hud_state();
+                if (ocr_generation_timed_out(handled_generation)) {
+                    set_ocr_error_state("OCR timed out after 20s.", "OCR request timed out after 20 seconds.");
+                } else {
+                    set_ocr_error_state(g_status, g_status);
+                }
             }
         }
         if (handled_generation == g_ocr_generation.load(std::memory_order_acquire)) {
@@ -1045,6 +1244,8 @@ bool queue_ocr_request(const char *source) {
     const u32 request_generation = g_ocr_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     g_ocr_requested.store(true, std::memory_order_release);
     g_ocr_pending.store(true, std::memory_order_release);
+    g_ocr_timeout_generation.store(0, std::memory_order_release);
+    g_ocr_started_tick.store(svcGetSystemTick(), std::memory_order_release);
     g_word_count = 0;
     g_selected_word = -1;
     g_sentence[0] = '\0';
@@ -1549,6 +1750,7 @@ int main(int argc, char **argv) {
         }
 
         poll_request_file();
+        poll_ocr_timeout();
 
         if (pad_ready) {
             padUpdate(&pad);

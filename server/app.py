@@ -22,6 +22,10 @@ LATEST_FRAME = SERVER_DIR / "latest_frame.jpg"
 UDP_RESPONSE_LIMIT = 12_000
 
 
+def recent_frame_fallback_seconds() -> float:
+    return float(os.environ.get("SYSDVR_RECENT_FRAME_FALLBACK_SECONDS", "2.0"))
+
+
 def latest_frame_metadata() -> dict[str, Any]:
     if not LATEST_FRAME.exists():
         return {}
@@ -35,6 +39,16 @@ def latest_frame_metadata() -> dict[str, Any]:
     }
 
 
+def latest_frame_age_seconds() -> float | None:
+    if not LATEST_FRAME.exists():
+        return None
+    return time.time() - LATEST_FRAME.stat().st_mtime
+
+
+def concise_error(message: str) -> str:
+    return message.splitlines()[0].strip() if message.strip() else "Unknown error"
+
+
 def ocr_latest_payload() -> dict[str, Any]:
     started = time.time()
     capture_error = ""
@@ -44,15 +58,18 @@ def ocr_latest_payload() -> dict[str, Any]:
         except Exception as exc:
             capture_error = str(exc)
             print(f"[FrameCapture] on-request capture failed: {exc}", flush=True)
-            if os.environ.get("SYSDVR_ALLOW_STALE_FRAME_ON_CAPTURE_FAIL", "0") != "1":
+            fallback_seconds = recent_frame_fallback_seconds()
+            frame_age = latest_frame_age_seconds()
+            if frame_age is None or frame_age > fallback_seconds:
                 return {
                     "ok": False,
                     "success": False,
-                    "error": f"Frame capture failed: {capture_error}",
+                    "error": f"Frame capture failed: {concise_error(capture_error)}",
                     "capture_error": capture_error,
                     "display_text": "Mac frame capture failed.",
                     **latest_frame_metadata(),
                 }
+            print(f"[FrameCapture] using recent frame after capture failure, age={frame_age:.2f}s", flush=True)
 
     if not LATEST_FRAME.exists():
         return {
@@ -67,6 +84,7 @@ def ocr_latest_payload() -> dict[str, Any]:
     payload.update(latest_frame_metadata())
     if capture_error:
         payload["capture_error"] = capture_error
+        payload["frame_fallback"] = "recent"
     print(f"[SwitchOCR] /ocr-latest total {time.time() - started:.2f}s, bytes={len(body)}", flush=True)
     return payload
 
@@ -210,7 +228,16 @@ class OcrDevHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/ocr-latest":
-            payload = compact_switch_payload(ocr_latest_payload())
+            try:
+                payload = compact_switch_payload(ocr_latest_payload())
+            except Exception as exc:
+                print(f"[SwitchOCR] /ocr-latest failed: {exc}", flush=True)
+                payload = {
+                    "ok": False,
+                    "success": False,
+                    "error": f"OCR request failed: {concise_error(str(exc))}",
+                    "display_text": "Mac OCR request failed.",
+                }
             status = HTTPStatus.OK if payload.get("ok") else HTTPStatus.SERVICE_UNAVAILABLE
             self._send_json(payload, status)
             return
