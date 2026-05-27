@@ -4,6 +4,7 @@
 server/last_ocr_upload.jpg
 server/latest_frame.jpg
 server/*.tmp.mp4
+server/*.log
 
 switch/hello_ocr_nro/build/
 switch/hello_ocr_nro/*.elf
