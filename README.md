@@ -60,6 +60,24 @@ ISSEN_LANGUAGE=japanese
 
 `.env` is git-ignored. Do not commit credentials.
 
+Dictionary enrichment uses user-provided Yomitan/Yomichan ZIP dictionaries. The project does not ship dictionary data; download dictionaries separately, for example from the [Yomichan dictionary guide](https://learnjapanese.moe/yomichan/), and check each dictionary's license before use.
+
+For reproducible setup, keep the ZIP files anywhere readable by the server and point `.env` at them:
+
+```sh
+YOMITAN_TERM_DICTIONARY_PATHS=/path/to/[Bilingual] JMdict (Recommended).zip
+YOMITAN_FREQUENCY_PATHS=/path/to/[Freq] Example Frequency.zip
+YOMITAN_KANJI_PATHS=/path/to/KANJIDIC.zip
+```
+
+Each variable accepts multiple ZIP paths separated with the OS path separator (`:` on macOS/Linux). If these variables are not set, the server auto-detects dictionaries on the current user's Desktop:
+
+- Terms: ZIPs matching `*JMdict*Recommended*.zip`, with `[Bilingual] JMdict (Recommended).zip` preferred.
+- Frequency: ZIPs whose filenames start with `[Freq]`.
+- Kanji: ZIPs whose filenames include `KANJIDIC`.
+
+Supported archives are Yomitan/Yomichan ZIP dictionaries containing `term_bank_*.json` for terms, `term_meta_bank_*.json` for frequency, or `kanji_bank_*.json` for kanji. Restart the server after changing `.env` or replacing dictionary ZIPs.
+
 For LAN-only testing, set `MAC_IP` in `Makefile` to this Mac's LAN address before building the sysmodule. Remote HTTPS users can keep the baked LAN host as a fallback because `remote.json` takes precedence.
 
 ### 2. Run the Server
