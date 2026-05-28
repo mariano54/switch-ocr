@@ -1,6 +1,10 @@
 # Switch OCR
 
-Always-on, in-game Japanese OCR for the Nintendo Switch. Press `Minus` or `Capture` in any game; the Atmosphere sysmodule captures a `caps:sc` JPEG screenshot, uploads it to the Mac server at `/ocr-upload`, and the Tesla overlay draws the Japanese text, selected word, reading, definition, frequency, kanji info, and mining status over the game.
+Always-on, in-game Japanese OCR and immersion mining tool for the Nintendo Switch. Press `Minus` or `Capture` in any game; the Atmosphere sysmodule captures a `caps:sc` JPEG screenshot, uploads it to the Mac server at `/ocr-upload`, and the Tesla overlay draws the Japanese text, selected word, reading, definition, frequency, and kanji info over the game. Select a word and mine it straight into your saved-words collection without leaving the game.
+
+Mining currently syncs to [ISSEN](https://issen.com). Anki is not supported yet, but pull requests adding an Anki mining backend are welcome.
+
+![Switch OCR overlay mining a word in-game](docs/screenshot.png)
 
 ## Architecture
 
