@@ -259,3 +259,9 @@ run_server.sh                 LaunchAgent server entrypoint
 ## Credits
 
 Built on [libnx](https://github.com/switchbrew/libnx), [libtesla](https://github.com/WerWolv/libtesla), Google Gemini, JMDict, frequency dictionaries, and kanji dictionaries.
+
+## License
+
+This project's own source is released under the [MIT License](LICENSE).
+
+The bundled `switch/overlay/include/tesla.hpp` is part of [libtesla](https://github.com/WerWolv/libtesla) and remains under its own GPLv2-or-later license; it is not covered by the MIT license above. User-provided dictionary data keeps its respective license.
