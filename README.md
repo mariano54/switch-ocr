@@ -92,21 +92,19 @@ For LAN fallback, verify from another machine on the same network:
 curl http://<mac-ip>:8742/health
 ```
 
-### 3. Configure Cloudflare Tunnel
-
-The current remote endpoint is:
+### 3. Configure Remote HTTPS
 
 ```text
-https://ocr.captivatelion.com/ocr-upload
+https://ocr.example.com/ocr-upload
 ```
 
-The stable Cloudflare Tunnel should route `ocr.captivatelion.com` to the Mac server on port `8742`. A typical `~/.cloudflared/config.yml` looks like:
+Remote HTTPS is optional, but recommended outside a trusted LAN. One common setup is a Cloudflare Tunnel routing your hostname to the server on port `8742`. A typical `~/.cloudflared/config.yml` looks like:
 
 ```yaml
 tunnel: switchocr
-credentials-file: /Users/YOUR_USER/.cloudflared/<tunnel-id>.json
+credentials-file: <home>/.cloudflared/<tunnel-id>.json
 ingress:
-  - hostname: ocr.captivatelion.com
+  - hostname: ocr.example.com
     service: http://127.0.0.1:8742
   - service: http_status:404
 ```
@@ -124,7 +122,7 @@ launchctl kickstart -k gui/$(id -u)/com.switchocr.cloudflare-tunnel
 Verify the tunnel:
 
 ```sh
-curl https://ocr.captivatelion.com/health
+curl https://ocr.example.com/health
 ```
 
 Do not expose `/ocr-upload` publicly without the server-side API key registry installed.
@@ -134,7 +132,7 @@ Do not expose `/ocr-upload` publicly without the server-side API key registry in
 Create a server key registry and Switch `remote.json`:
 
 ```sh
-make remote-key-create REMOTE_ENDPOINT=https://ocr.captivatelion.com/ocr-upload
+make remote-key-create REMOTE_ENDPOINT=https://ocr.example.com/ocr-upload REMOTE_KEY_NAME=<key-name>
 ```
 
 This writes:
@@ -144,7 +142,7 @@ This writes:
 tmp/switchocr_remote.json      # client config to install on the Switch
 ```
 
-If the Mac mini runs the server and the key was created elsewhere, copy `~/.switchocr/api_keys.json` to the same path on the Mac mini and restart the server. Install the Switch config over DBI MTP:
+Run this command on the server host so `~/.switchocr/api_keys.json` is created where the server will read it. Install the Switch config over DBI MTP:
 
 ```sh
 make remote-key-install
@@ -152,15 +150,17 @@ make remote-key-install
 
 When `sdmc:/config/switch-ocr/remote.json` exists, the sysmodule uses HTTPS/DNS and signs requests to its `endpoint`. When it is absent, the sysmodule uses the compiled LAN HTTP fallback.
 
-Remote HMAC timestamps are accepted within 30 days by default to tolerate Switch clock drift after reboot/CFW. Override that window with `SWITCHOCR_TIMESTAMP_SKEW_SECONDS` if needed.
+Remote HMAC timestamps accept a wide clock-skew window by default to tolerate Switch clock drift after reboot/CFW. Override that window with `SWITCHOCR_TIMESTAMP_SKEW_SECONDS` if needed.
 
 ### 5. Build and Install Switch Artifacts
 
 Build with the devkitPro Docker image:
 
 ```sh
-/usr/bin/make sysmodule-build overlay-build
+/usr/bin/make MAC_IP=<mac-ip> sysmodule-build overlay-build
 ```
+
+`MAC_IP` is compiled into the sysmodule as the LAN HTTP fallback. Remote HTTPS users still install `remote.json`; when present, it takes precedence over the compiled fallback.
 
 Outputs:
 
@@ -214,7 +214,7 @@ Remote requests to protected endpoints require HMAC headers unless they come fro
 - **Overlay needs to be opened twice the first time.** This is normal `nx-ovlloader` cold-load behavior; subsequent opens are immediate.
 - **`Missing GOOGLE_AI_STUDIO_API_KEY` in server logs.** Put `.env` at the repo root and restart the LaunchAgent.
 - **LAN OCR upload fails.** Confirm `MAC_IP` / `SERVER_HOST` points at this Mac, the server is reachable on port `8742`, and the Switch and Mac are on the same network. Remove `remote.json` only when intentionally testing LAN fallback.
-- **Remote OCR returns an auth error.** Recreate and reinstall `remote.json`, copy the matching `~/.switchocr/api_keys.json` to the server host, and restart the server. If the error mentions timestamp skew, keep the current 30-day default or set `SWITCHOCR_TIMESTAMP_SKEW_SECONDS` explicitly.
+- **Remote OCR returns an auth error.** Recreate and reinstall `remote.json`, copy the matching `~/.switchocr/api_keys.json` to the server host, and restart the server. If the error mentions timestamp skew, make sure the server is running the current code or set `SWITCHOCR_TIMESTAMP_SKEW_SECONDS` explicitly.
 - **Remote OCR reports `curl request failed: 60`.** Rebuild, reinstall, and reboot into the current sysmodule; older builds may still be using certificate validation settings that are not compatible with the Switch environment.
 - **HUD never appears in-game.** Confirm `nx-ovlloader`, Tesla-Menu, and `switch-ocr.ovl` are installed, then check the Tesla combo in `sdmc:/config/tesla/config.ini`.
 - **Switch boots to OFW intermittently.** This is usually modchip glitch failure or Hekate autoboot configuration, not Switch OCR.
