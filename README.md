@@ -13,7 +13,7 @@ Always-on, in-game Japanese OCR overlay for the Nintendo Switch. Pressing `Minus
 
 - `switch/sysmodule/`: Atmosphere boot sysmodule. Polls `Minus` and D-pad input, sends OCR HTTP requests, writes results to `sdmc:/config/switch-ocr/`.
 - `switch/overlay/`: Tesla overlay that auto-opens as a fullscreen transparent HUD, reads result files, draws the sentence + selected word + definition.
-- `server/`: Python HTTP server on the Mac that captures the latest Switch frame via SysDVR TCP bridge and calls Gemini.
+- `server/`: Python HTTP server on the Mac. The current sysmodule uploads a `caps:sc` JPEG to `/ocr-upload`; the older SysDVR `/ocr-latest` path remains as a disabled fallback/debug path.
 
 ## Requirements
 
@@ -33,10 +33,19 @@ Fill in your exact versions in `Tested Config` below.
 
 - macOS 14 or later. Confirmed: macOS 26.x on Apple Silicon.
 - Python 3.9 or later.
-- ffmpeg (Homebrew): `brew install ffmpeg`.
 - Docker Desktop or compatible (for building Switch artifacts via `devkitpro/devkita64`).
 - Google AI Studio API key.
-- `libmtp` (Homebrew, only needed for MTP-based install): `brew install libmtp`.
+- Homebrew packages:
+
+```sh
+brew install ffmpeg libmtp pkg-config cloudflared
+```
+
+Package usage:
+
+- `ffmpeg` — legacy SysDVR frame capture/debug path.
+- `libmtp` + `pkg-config` — build and use the MTP install helper.
+- `cloudflared` — optional remote access via Cloudflare Tunnel.
 
 ### Network
 
@@ -134,8 +143,55 @@ launchctl kickstart -k gui/$(id -u)/com.switchocr.server
 Logs go to `~/Library/Logs/SwitchOCR/server.{out,err}.log`. Verify:
 
 ```sh
-curl http://<mac-ip>:8000/health
+curl http://<mac-ip>:8742/health
 ```
+
+### 6. Optional Cloudflare Tunnel
+
+Cloudflare Tunnel can expose the Mac mini without a static ISP IP or router port forwarding. Keep the Python server private on `127.0.0.1:8742` for production; the current LAN LaunchAgent uses `0.0.0.0` for Switch LAN testing.
+
+For a no-account public smoke test from the Mac mini:
+
+```sh
+./scripts/run_cloudflare_quick_tunnel.sh
+```
+
+`cloudflared` prints a temporary `https://*.trycloudflare.com` URL. Test:
+
+```sh
+curl https://<temporary-host>/health
+```
+
+For a stable production tunnel:
+
+```sh
+cloudflared tunnel login
+cloudflared tunnel create switchocr
+cloudflared tunnel route dns switchocr ocr.example.com
+```
+
+Create `~/.cloudflared/config.yml` on the Mac mini:
+
+```yaml
+tunnel: switchocr
+credentials-file: /Users/YOUR_USER/.cloudflared/<tunnel-id>.json
+ingress:
+  - hostname: ocr.example.com
+    service: http://127.0.0.1:8742
+  - service: http_status:404
+```
+
+Then install the LaunchAgent template:
+
+```sh
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs/SwitchOCR
+sed "s|REPLACE_ME_HOME|$HOME|g" scripts/com.switchocr.cloudflare-tunnel.plist \
+    > ~/Library/LaunchAgents/com.switchocr.cloudflare-tunnel.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.switchocr.cloudflare-tunnel.plist
+launchctl kickstart -k gui/$(id -u)/com.switchocr.cloudflare-tunnel
+```
+
+Do not expose `/ocr-upload` publicly without adding HMAC authentication, replay protection, request size limits, and rate limits.
 
 ## Usage
 
@@ -151,7 +207,8 @@ If you press `Minus` again while a request is in flight, the previous one is abo
 ## Endpoints
 
 - `GET /health` — liveness check.
-- `POST /ocr-latest` — captures a fresh frame from the Switch via SysDVR bridge and OCRs it. Used by the Switch sysmodule.
+- `POST /ocr-upload` — OCRs an uploaded Switch JPEG. Used by the Switch sysmodule.
+- `POST /ocr-latest` — older SysDVR latest-frame path, kept as a fallback/debug endpoint.
 - `POST /ocr` — OCR an uploaded image (debugging).
 - `POST /hello` — echo endpoint (debugging).
 

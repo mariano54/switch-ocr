@@ -10,7 +10,7 @@ SWITCH_IP ?=
 .PHONY: server switch-build switch-run switch-clean overlay-build overlay-clean overlay-install overlay-install-reload sysmodule-build sysmodule-clean sysmodule-install sysmodule-enable-boot switch-ocr-install tesla-hotkey-install
 
 server:
-	python3 server/app.py --host 0.0.0.0 --port 8000
+	python3 server/app.py --host 0.0.0.0 --port 8742
 
 switch-build:
 	docker run --rm -v "$(PROJECT_ROOT):/work" -w "$(SWITCH_APP_DIR)" "$(DEVKIT_IMAGE)" \

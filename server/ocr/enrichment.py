@@ -25,10 +25,14 @@ def _word_terms(word: OcrWord) -> list[str]:
     return list(dict.fromkeys(term for term in terms if term))
 
 
+def _short_meaning(meaning: str) -> str:
+    return " ".join(meaning.split()[:2])
+
+
 def _kanji_summary(text: str) -> str:
     parts: list[str] = []
     for entry in lookup_kanji_text(text):
-        meaning = ", ".join(entry["meanings"][:2])
+        meaning = ", ".join(part for part in (_short_meaning(raw) for raw in entry["meanings"][:2]) if part)
         if meaning:
             parts.append(f'{entry["kanji"]} {meaning}')
         if len(parts) >= 2:

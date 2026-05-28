@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template LaunchAgent for a named Cloudflare Tunnel.
+
+  Before installing:
+    1. Install cloudflared on the Mac mini.
+    2. Run `cloudflared tunnel login`.
+    3. Run `cloudflared tunnel create switchocr`.
+    4. Route a DNS name, e.g. `cloudflared tunnel route dns switchocr ocr.example.com`.
+    5. Configure ~/.cloudflared/config.yml to forward that hostname to http://127.0.0.1:8742.
+
+  Replace REPLACE_ME_HOME before copying this file to ~/Library/LaunchAgents/.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.switchocr.cloudflare-tunnel</string>
+
+	<key>WorkingDirectory</key>
+	<string>REPLACE_ME_HOME/Projects/SwitchOCR</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>SWITCHOCR_CLOUDFLARE_TUNNEL</key>
+		<string>switchocr</string>
+	</dict>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>REPLACE_ME_HOME/Projects/SwitchOCR/scripts/run_cloudflare_tunnel.sh</string>
+	</array>
+
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>REPLACE_ME_HOME/Library/Logs/SwitchOCR/cloudflare-tunnel.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>REPLACE_ME_HOME/Library/Logs/SwitchOCR/cloudflare-tunnel.err.log</string>
+</dict>
+</plist>

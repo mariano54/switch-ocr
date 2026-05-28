@@ -18,6 +18,13 @@ from .types import OcrResult
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
+
+def _log(message: str) -> None:
+    try:
+        print(message, flush=True)
+    except OSError:
+        pass
+
 OCR_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
     "properties": {
@@ -74,7 +81,7 @@ class GeminiOcrProvider:
             ],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 2048,
+                "maxOutputTokens": 1024,
                 "responseMimeType": "application/json",
                 "responseSchema": OCR_RESPONSE_SCHEMA,
                 "candidateCount": 1,
@@ -124,7 +131,7 @@ class GeminiOcrProvider:
 
         words = enrich_words(normalize_words(parsed.get("words") if isinstance(parsed, dict) else []))
         elapsed = time.time() - started
-        print(f"[GeminiOCR] {elapsed:.2f}s, words={len(words)}", flush=True)
+        _log(f"[GeminiOCR] {elapsed:.2f}s, words={len(words)}")
         return {
             "success": True,
             "provider": self.name,
@@ -145,7 +152,7 @@ class GeminiOcrProvider:
         }
         if raw is not None:
             result["raw"] = raw
-        print(f"[GeminiOCR] ERROR: {message}", flush=True)
+        _log(f"[GeminiOCR] ERROR: {message}")
         return result
 
     def _extract_text(self, response: dict[str, Any]) -> str:

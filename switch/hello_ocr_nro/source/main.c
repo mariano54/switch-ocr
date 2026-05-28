@@ -15,7 +15,7 @@
 #endif
 
 #ifndef SERVER_PORT
-#define SERVER_PORT 8000
+#define SERVER_PORT 8742
 #endif
 
 #define RESPONSE_SIZE 16384

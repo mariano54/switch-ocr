@@ -17,4 +17,4 @@ export SYSDVR_RECENT_FRAME_FALLBACK_SECONDS="${SYSDVR_RECENT_FRAME_FALLBACK_SECO
 export SYSDVR_READY_FRAME_MAX_AGE_SECONDS="${SYSDVR_READY_FRAME_MAX_AGE_SECONDS:-1.5}"
 export SYSDVR_USE_PTY="${SYSDVR_USE_PTY:-1}"
 
-exec python3 server/app.py --host 0.0.0.0 --port 8000
+exec python3 server/app.py --host 0.0.0.0 --port 8742

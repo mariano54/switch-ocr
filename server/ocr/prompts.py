@@ -5,7 +5,7 @@ Transcribe only the current active dialogue: the lowest contiguous block of brig
 
 Split the active dialogue into vocabulary-sized entries. Keep proper nouns, compounds, idioms, and fixed expressions together when they act as one vocabulary item. Never return a whole sentence or long clause as one entry.
 
-Return each entry as {"w":"surface","b":"base","t":"English definition"}. For verbs/adjectives, "b" is the dictionary/base form. For nouns, "b" may match "w". Include particles and punctuation as separate "w" entries when needed to reconstruct the sentence, but set their "b" and "t" to "".
+Return each entry as {"w":"surface","b":"base","t":"short English gloss"}. Keep "t" to 1-3 words, never a sentence. For verbs/adjectives, "b" is the dictionary/base form. For nouns, "b" may match "w". Include particles and punctuation as separate "w" entries when needed to reconstruct the sentence, but set their "b" and "t" to "".
 
 For any kanji in "w" or "b", wrap the full word in HTML ruby with contextual hiragana reading, e.g. "<ruby>日本語<rt>にほんご</rt></ruby>". Do not use parenthetical readings.
 

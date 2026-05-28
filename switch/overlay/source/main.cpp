@@ -54,8 +54,10 @@ size_t g_word_count = 0;
 int g_selected_word = -1;
 int g_saved_word_total = 0;
 int g_lookup_count = 0;
+u32 g_spinner_frame = 0;
 bool g_hud_pending = false;
 bool g_hud_saved = false;
+bool g_hud_saving = false;
 bool g_sd_mounted = false;
 
 void copyText(char *out, size_t outSize, const char *text) {
@@ -472,6 +474,7 @@ void parseHudJson(const char *json) {
     g_hud_kanji[0] = '\0';
     g_hud_mining_status[0] = '\0';
     g_hud_saved = false;
+    g_hud_saving = false;
     if (!hasSelected || g_selected_word >= 0) {
         parseJsonField(json, end, "f", g_hud_frequency, sizeof(g_hud_frequency));
         parseJsonField(json, end, "k", g_hud_kanji, sizeof(g_hud_kanji));
@@ -482,6 +485,10 @@ void parseHudJson(const char *json) {
     bool saved = false;
     if (parseJsonBoolField(json, end, "saved", saved)) {
         g_hud_saved = saved;
+    }
+    bool saving = false;
+    if (parseJsonBoolField(json, end, "saving", saving)) {
+        g_hud_saving = saving;
     }
     bool pending = false;
     if (parseJsonBoolField(json, end, "pending", pending)) {
@@ -539,17 +546,17 @@ public:
     class HudElement final : public tsl::elm::Element {
     public:
         void draw(tsl::gfx::Renderer *renderer) override {
+            g_spinner_frame++;
             renderer->clearScreen();
 
-            constexpr s32 panel_x = 24;
-            constexpr s32 panel_y = 592;
-            constexpr s32 panel_w = 1232;
-            constexpr s32 panel_h = 108;
-            renderer->drawRect(panel_x, panel_y, panel_w, panel_h, tsl::Color(0, 0, 0, 8));
-            renderer->drawRect(panel_x, panel_y, panel_w, 2, tsl::Color(0, 15, 13, 12));
+            constexpr s32 panel_x = 0;
+            constexpr s32 panel_y = 636;
+            constexpr s32 panel_w = 1280;
+            constexpr s32 panel_h = 84;
+            renderer->drawRect(panel_x, panel_y, panel_w, panel_h, tsl::Color(0, 0, 0, 11));
 
-            drawParagraph(renderer, panel_x + 14, panel_y + 31, panel_w - 28);
-            drawTargetRow(renderer, panel_x + 14, panel_y + 86, panel_w - 28);
+            drawParagraph(renderer, panel_x + 16, panel_y + 26, panel_w - 32);
+            drawTargetRow(renderer, panel_x + 16, panel_y + 54, panel_w - 32);
         }
 
         void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
@@ -562,7 +569,9 @@ public:
 
     private:
         static constexpr float ParagraphFontSize = 18.0F;
-        static constexpr s32 ParagraphLineHeight = 24;
+        static constexpr s32 ParagraphLineHeight = 15;
+        static constexpr s32 HighlightHeight = 22;
+        static constexpr s32 HighlightYOffset = 18;
 
         s32 measureText(tsl::gfx::Renderer *renderer, const char *text, float fontSize) {
             if (text == nullptr || text[0] == '\0') {
@@ -662,10 +671,28 @@ public:
             drawText(renderer, line2, x, y + ParagraphLineHeight, ParagraphFontSize, tsl::Color(13, 13, 13, 15), maxWidth);
         }
 
+        char spinnerChar() const {
+            constexpr char frames[] = "|/-\\";
+            return frames[(g_spinner_frame / 6) % 4];
+        }
+
+        bool ocrLoading() const {
+            return strncmp(g_target, "Loading", 7) == 0 || g_hud_pending;
+        }
+
+        bool savingWord() const {
+            return g_hud_saving;
+        }
+
+        void compactSpinner(const char *label, char *out, size_t outSize) const {
+            snprintf(out, outSize, "%s %c", label, spinnerChar());
+        }
+
         void drawParagraph(tsl::gfx::Renderer *renderer, s32 x, s32 y, s32 maxWidth) {
             if (g_word_count == 0) {
-                const char *text = (strncmp(g_target, "Loading", 7) == 0 || g_hud_pending) ? "Loading..." : g_result;
-                drawPlainParagraph(renderer, text, x, y, maxWidth);
+                char loading[16];
+                compactSpinner("OCR", loading, sizeof(loading));
+                drawPlainParagraph(renderer, ocrLoading() ? loading : g_result, x, y, maxWidth);
                 return;
             }
 
@@ -691,7 +718,7 @@ public:
 
                 const bool selected = static_cast<int>(i) == g_selected_word;
                 if (selected && wordWidth > 0) {
-                    renderer->drawRect(cursorX - 2, cursorY - 19, wordWidth + 4, ParagraphLineHeight, tsl::Color(0, 15, 13, 7));
+                    renderer->drawRect(cursorX - 2, cursorY - HighlightYOffset, wordWidth + 4, HighlightHeight, tsl::Color(0, 15, 13, 7));
                 }
                 cursorX = drawText(
                     renderer,
@@ -706,10 +733,8 @@ public:
         }
 
         void compactStatus(char *out, size_t outSize) {
-            if (strncmp(g_target, "Loading", 7) == 0 || g_hud_pending || strstr(g_status, "Waiting") != nullptr ||
-                strstr(g_status, "request") != nullptr || strstr(g_status, "pending") != nullptr ||
-                strstr(g_status, "sent") != nullptr) {
-                copyText(out, outSize, "Loading");
+            if (ocrLoading()) {
+                compactSpinner("OCR", out, outSize);
                 return;
             }
             if (strstr(g_status, "failed") != nullptr || strstr(g_status, "Failed") != nullptr ||
@@ -719,27 +744,41 @@ public:
                 copyText(out, outSize, "Error");
                 return;
             }
+            if (strstr(g_status, "Waiting") != nullptr || strstr(g_status, "request") != nullptr ||
+                strstr(g_status, "pending") != nullptr || strstr(g_status, "sent") != nullptr) {
+                compactSpinner("OCR", out, outSize);
+                return;
+            }
+            if (savingWord()) {
+                compactSpinner("Save", out, outSize);
+                return;
+            }
             copyText(out, outSize, "Done");
         }
 
-        void formatMeta(const OcrWord &word, char *out, size_t outSize) {
+        void formatMetaPrefix(char *out, size_t outSize) {
             out[0] = '\0';
-            const char *frequency = g_hud_frequency[0] != '\0' ? g_hud_frequency : word.frequency;
-            const char *kanji = g_hud_kanji[0] != '\0' ? g_hud_kanji : word.kanji;
             char totals[64];
-            snprintf(totals, sizeof(totals), "Lookups %d   Words %d", g_lookup_count, g_saved_word_total);
+            snprintf(totals, sizeof(totals), "W %d", g_saved_word_total);
             appendText(out, outSize, totals);
             appendText(out, outSize, g_hud_saved ? "   Saved" : "   New");
-            if (frequency[0] != '\0') {
-                appendText(out, outSize, "   ");
-                appendText(out, outSize, "Freq ");
-                appendText(out, outSize, frequency);
-            }
-            if (kanji[0] != '\0') {
-                if (out[0] != '\0') {
-                    appendText(out, outSize, "   ");
+        }
+
+        void truncateUtf8Chars(const char *text, size_t maxChars, char *out, size_t outSize) {
+            out[0] = '\0';
+            size_t usedChars = 0;
+            const char *cursor = text != nullptr ? text : "";
+            while (*cursor != '\0' && usedChars < maxChars) {
+                const size_t charLen = utf8CharLen(cursor);
+                if (strlen(out) + charLen + 1 >= outSize) {
+                    break;
                 }
-                appendText(out, outSize, kanji);
+                appendBytes(out, outSize, cursor, charLen);
+                cursor += charLen;
+                usedChars++;
+            }
+            if (*cursor != '\0' && strlen(out) + 4 < outSize) {
+                appendText(out, outSize, "...");
             }
         }
 
@@ -750,46 +789,138 @@ public:
             return &g_words[g_selected_word];
         }
 
+        const char *nextKanjiEntry(const char *cursor, char *kanji, size_t kanjiSize, char *meaning, size_t meaningSize) {
+            while (*cursor == ' ') {
+                cursor++;
+            }
+            if (*cursor == '\0') {
+                return nullptr;
+            }
+
+            kanji[0] = '\0';
+            meaning[0] = '\0';
+            const size_t kanjiBytes = utf8CharLen(cursor);
+            appendBytes(kanji, kanjiSize, cursor, kanjiBytes);
+            cursor += kanjiBytes;
+            while (*cursor == ' ') {
+                cursor++;
+            }
+
+            size_t words = 0;
+            bool inWord = false;
+            while (*cursor != '\0') {
+                const bool entryBreak = cursor[0] == ' ' && cursor[1] != '\0' && cursor[1] == ' ' &&
+                                        cursor[2] != '\0' && cursor[2] == ' ';
+                if (entryBreak) {
+                    cursor += 3;
+                    break;
+                }
+                const bool separator = *cursor == ' ' || *cursor == ',' || *cursor == ';';
+                if (separator) {
+                    if (inWord) {
+                        words++;
+                        inWord = false;
+                        if (words >= 2) {
+                            while (*cursor != '\0') {
+                                const bool nextBreak = cursor[0] == ' ' && cursor[1] != '\0' && cursor[1] == ' ' &&
+                                                       cursor[2] != '\0' && cursor[2] == ' ';
+                                if (nextBreak) {
+                                    break;
+                                }
+                                cursor++;
+                            }
+                            if (*cursor != '\0') {
+                                cursor += 3;
+                            }
+                            break;
+                        }
+                    }
+                    if (meaning[0] != '\0' && meaning[strlen(meaning) - 1] != ' ') {
+                        appendText(meaning, meaningSize, " ");
+                    }
+                    cursor++;
+                    continue;
+                }
+                inWord = true;
+                appendBytes(meaning, meaningSize, cursor, utf8CharLen(cursor));
+                cursor += utf8CharLen(cursor);
+            }
+            return cursor;
+        }
+
+        void drawMeta(
+            tsl::gfx::Renderer *renderer,
+            const OcrWord &word,
+            s32 x,
+            s32 y,
+            s32 maxWidth,
+            s32 statusWidth
+        ) {
+            const char *frequency = g_hud_frequency[0] != '\0' ? g_hud_frequency : word.frequency;
+            const char *kanji = g_hud_kanji[0] != '\0' ? g_hud_kanji : word.kanji;
+            const tsl::Color frequencyColor = word.frequency_value < 0 ? tsl::Color(13, 13, 12, 15)
+                : word.frequency_value < 30000                    ? tsl::Color(4, 15, 5, 15)
+                : word.frequency_value <= 50000                   ? tsl::Color(15, 14, 3, 15)
+                                                                  : tsl::Color(15, 4, 3, 15);
+            s32 cursorX = x;
+            const s32 rightLimit = x + maxWidth - statusWidth - 18;
+
+            char prefix[96];
+            formatMetaPrefix(prefix, sizeof(prefix));
+            cursorX = drawText(renderer, prefix, cursorX, y, 12.0F, tsl::Color(11, 11, 11, 15), rightLimit - cursorX, false);
+            if (frequency[0] != '\0' && cursorX < rightLimit) {
+                char freq[48];
+                snprintf(freq, sizeof(freq), "  F %s", frequency);
+                cursorX = drawText(renderer, freq, cursorX + 6, y, 15.0F, frequencyColor, rightLimit - cursorX - 6, false);
+            }
+
+            const char *entry = kanji;
+            while (entry != nullptr && *entry != '\0' && cursorX < rightLimit) {
+                char kanjiChar[8];
+                char meaning[48];
+                entry = nextKanjiEntry(entry, kanjiChar, sizeof(kanjiChar), meaning, sizeof(meaning));
+                if (entry == nullptr || kanjiChar[0] == '\0') {
+                    break;
+                }
+                cursorX = drawText(renderer, kanjiChar, cursorX + 12, y, 19.0F, tsl::Color(15, 15, 14, 15), rightLimit - cursorX - 12, false);
+                if (meaning[0] != '\0' && cursorX < rightLimit) {
+                    cursorX = drawText(renderer, meaning, cursorX + 4, y, 14.0F, tsl::Color(12, 14, 12, 15), rightLimit - cursorX - 4, false);
+                }
+            }
+        }
+
         void drawTargetRow(tsl::gfx::Renderer *renderer, s32 x, s32 y, s32 maxWidth) {
             char status[16];
             compactStatus(status, sizeof(status));
 
             const OcrWord *word = selectedWord();
-            char meta[256] = "";
-            if (word != nullptr && strcmp(status, "Loading") != 0) {
-                formatMeta(*word, meta, sizeof(meta));
-            }
-
             constexpr float statusSize = 11.0F;
-            constexpr float metaSize = 12.0F;
             const s32 rightEdge = x + maxWidth;
-            const s32 metaAreaX = meta[0] != '\0' ? x + (maxWidth * 2 / 3) : rightEdge;
+            const bool showMeta = word != nullptr && !ocrLoading();
+            const s32 metaAreaX = showMeta ? x + (maxWidth * 3 / 5) : rightEdge;
             const s32 metaMaxWidth = rightEdge - metaAreaX;
-            s32 metaWidth = measureText(renderer, meta, metaSize);
-            if (metaWidth > metaMaxWidth) {
-                metaWidth = metaMaxWidth;
-            }
-            const s32 metaX = meta[0] != '\0' ? metaAreaX : rightEdge;
             const s32 statusWidth = measureText(renderer, status, statusSize);
-            const s32 statusX = (meta[0] != '\0' ? metaX : rightEdge) - statusWidth - 16;
+            const s32 statusX = rightEdge - statusWidth;
             const tsl::Color statusColor = strcmp(status, "Error") == 0 ? tsl::Color(15, 5, 4, 15)
-                : strcmp(status, "Loading") == 0                  ? tsl::Color(0, 15, 13, 15)
+                : (ocrLoading() || savingWord())                   ? tsl::Color(0, 15, 13, 15)
                                                                    : tsl::Color(10, 10, 10, 15);
             drawText(renderer, status, statusX, y, statusSize, statusColor, statusWidth + 4, false);
-            if (meta[0] != '\0') {
-                drawText(renderer, meta, metaX, y, metaSize, tsl::Color(11, 11, 11, 15), metaWidth);
+            if (showMeta) {
+                drawMeta(renderer, *word, metaAreaX, y, metaMaxWidth, statusWidth);
             }
 
             s32 leftMax = statusX - x - 14;
             if (leftMax < 420) {
-                leftMax = meta[0] != '\0' ? metaX - x - 18 : maxWidth - 70;
+                leftMax = showMeta ? metaAreaX - x - 18 : maxWidth - 70;
             }
             if (leftMax <= 0) {
                 return;
             }
 
-            if (strcmp(status, "Loading") == 0) {
-                drawText(renderer, "Loading", x, y, 22.0F, tsl::Color(15, 9, 2, 15), leftMax);
+            if (ocrLoading()) {
+                char loading[16];
+                compactSpinner("OCR", loading, sizeof(loading));
+                drawText(renderer, loading, x, y, 22.0F, tsl::Color(15, 9, 2, 15), leftMax);
                 return;
             }
 
@@ -807,9 +938,9 @@ public:
                     renderer,
                     reading,
                     cursorX + 4,
-                    y + 2,
-                    14.0F,
-                    tsl::Color(10, 10, 10, 15),
+                    y,
+                    22.0F,
+                    tsl::Color(7, 15, 8, 15),
                     x + leftMax - cursorX - 4,
                     false
                 );
@@ -819,7 +950,8 @@ public:
                 cursorX = drawText(renderer, ": ", cursorX + 3, y, 18.0F, tsl::Color(10, 10, 10, 15), x + leftMax - cursorX - 3, false);
             }
 
-            const char *definition = word->definition[0] != '\0' ? word->definition : "No definition";
+            char definition[DefinitionSize];
+            truncateUtf8Chars(word->definition[0] != '\0' ? word->definition : "No definition", 60, definition, sizeof(definition));
             if (cursorX < x + leftMax) {
                 drawText(
                     renderer,

@@ -17,7 +17,7 @@ INCLUDES := include ../overlay/include
 
 TITLE_ID := 42000000534F4352
 SERVER_HOST ?= 192.168.0.124
-SERVER_PORT ?= 8000
+SERVER_PORT ?= 8742
 
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 

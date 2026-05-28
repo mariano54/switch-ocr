@@ -19,9 +19,18 @@ from ocr.formatting import switch_display_text
 
 SERVER_DIR = Path(__file__).resolve().parent
 LAST_OCR_UPLOAD = SERVER_DIR / "last_ocr_upload.jpg"
+SWITCH_SCREENSHOT_PROBE = SERVER_DIR / "switch_screenshot_probe.jpg"
+SWITCH_SCREENSHOT_PROBE_META = SERVER_DIR / "switch_screenshot_probe.json"
 LATEST_FRAME = SERVER_DIR / "latest_frame.jpg"
 UDP_RESPONSE_LIMIT = 12_000
 MINING_SERVICE: MiningService | None = None
+
+
+def log(message: str) -> None:
+    try:
+        print(message, flush=True)
+    except OSError:
+        pass
 
 
 def recent_frame_fallback_seconds() -> float:
@@ -80,7 +89,7 @@ def ocr_latest_payload() -> dict[str, Any]:
                 capture_performed = True
             except Exception as exc:
                 capture_error = str(exc)
-                print(f"[FrameCapture] on-request capture failed: {exc}", flush=True)
+                log(f"[FrameCapture] on-request capture failed: {exc}")
                 fallback_seconds = recent_frame_fallback_seconds()
                 frame_age = latest_frame_age_seconds()
                 if frame_age is None or frame_age > fallback_seconds:
@@ -92,7 +101,7 @@ def ocr_latest_payload() -> dict[str, Any]:
                         "display_text": "Mac frame capture failed.",
                         **latest_frame_metadata(),
                     }
-                print(f"[FrameCapture] using recent frame after capture failure, age={frame_age:.2f}s", flush=True)
+                log(f"[FrameCapture] using recent frame after capture failure, age={frame_age:.2f}s")
 
     if not LATEST_FRAME.exists():
         return {
@@ -110,7 +119,7 @@ def ocr_latest_payload() -> dict[str, Any]:
     if capture_error:
         payload["capture_error"] = capture_error
         payload["frame_fallback"] = "recent"
-    print(f"[SwitchOCR] /ocr-latest total {time.time() - started:.2f}s, bytes={len(body)}", flush=True)
+    log(f"[SwitchOCR] /ocr-latest total {time.time() - started:.2f}s, bytes={len(body)}")
     return payload
 
 
@@ -218,11 +227,11 @@ class UdpOcrServer:
                 continue
             except OSError:
                 if not self._stop.is_set():
-                    print("[UDP] socket error while receiving", flush=True)
+                    log("[UDP] socket error while receiving")
                 break
 
             command = data.decode("utf-8", errors="replace").strip()
-            print(f"{client[0]} - UDP {command or '<empty>'}", flush=True)
+            log(f"{client[0]} - UDP {command or '<empty>'}")
             if command != "ocr-latest":
                 response = {"ok": False, "success": False, "error": f"Unknown UDP command: {command}"}
             else:
@@ -239,7 +248,7 @@ class UdpOcrServer:
             try:
                 self._socket.sendto(compact_udp_payload(response), client)
             except OSError as exc:
-                print(f"[UDP] failed to reply to {client}: {exc}", flush=True)
+                log(f"[UDP] failed to reply to {client}: {exc}")
 
 
 class OcrDevHandler(BaseHTTPRequestHandler):
@@ -279,11 +288,59 @@ class OcrDevHandler(BaseHTTPRequestHandler):
             self._send_json(ocr_bytes_payload(body, content_type, LAST_OCR_UPLOAD))
             return
 
+        if self.path == "/ocr-upload":
+            body = self._read_body()
+            if not body:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "success": False,
+                        "error": "Empty OCR upload body.",
+                        "display_text": "Switch screenshot upload was empty.",
+                        "bytes": 0,
+                        "source": str(LAST_OCR_UPLOAD),
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            LAST_OCR_UPLOAD.write_bytes(body)
+            content_type = self.headers.get("Content-Type", "image/jpeg").split(";", 1)[0]
+            try:
+                payload = compact_switch_payload(ocr_bytes_payload(body, content_type, LAST_OCR_UPLOAD))
+            except Exception as exc:
+                log(f"[SwitchOCR] /ocr-upload failed: {exc}")
+                payload = {
+                    "ok": False,
+                    "success": False,
+                    "error": f"OCR request failed: {concise_error(str(exc))}",
+                    "display_text": "Mac OCR request failed.",
+                    "bytes": len(body),
+                    "source": str(LAST_OCR_UPLOAD),
+                }
+            status = HTTPStatus.OK if payload.get("ok") else HTTPStatus.SERVICE_UNAVAILABLE
+            self._send_json(payload, status)
+            return
+
+        if self.path == "/screenshot-probe":
+            body = self._read_body()
+            SWITCH_SCREENSHOT_PROBE.write_bytes(body)
+            payload = {
+                "ok": True,
+                "bytes": len(body),
+                "content_type": self.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0],
+                "saved_to": str(SWITCH_SCREENSHOT_PROBE),
+                "received_at": time.time(),
+            }
+            SWITCH_SCREENSHOT_PROBE_META.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            log(f"[SwitchScreenshotProbe] saved {len(body)} bytes to {SWITCH_SCREENSHOT_PROBE}")
+            self._send_json(payload)
+            return
+
         if self.path == "/ocr-latest":
             try:
                 payload = compact_switch_payload(ocr_latest_payload())
             except Exception as exc:
-                print(f"[SwitchOCR] /ocr-latest failed: {exc}", flush=True)
+                log(f"[SwitchOCR] /ocr-latest failed: {exc}")
                 payload = {
                     "ok": False,
                     "success": False,
@@ -297,7 +354,7 @@ class OcrDevHandler(BaseHTTPRequestHandler):
         if self.path == "/log":
             payload = self._read_json()
             message = str(payload.get("message", payload.get("raw", "")))[:1000]
-            print(f"[SwitchLog] {self.client_address[0]} - {message}", flush=True)
+            log(f"[SwitchLog] {self.client_address[0]} - {message}")
             self._send_json({"ok": True})
             return
 
@@ -311,7 +368,7 @@ class OcrDevHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         try:
-            print(f"{self.client_address[0]} - {fmt % args}", flush=True)
+            log(f"{self.client_address[0]} - {fmt % args}")
         except BrokenPipeError:
             pass
 
@@ -340,7 +397,7 @@ class OcrDevHandler(BaseHTTPRequestHandler):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local dev server for Switch OCR prototypes.")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8742)
     parser.add_argument("--no-frame-capture", action="store_true")
     args = parser.parse_args()
 
@@ -350,9 +407,9 @@ def main() -> None:
     MINING_SERVICE.startup()
     mining_status = MINING_SERVICE.status_payload()
     if mining_status.get("ok"):
-        print(f"[Mining] {mining_status['provider']} ready with {mining_status['saved_count']} saved words", flush=True)
+        log(f"[Mining] {mining_status['provider']} ready with {mining_status['saved_count']} saved words")
     else:
-        print(f"[Mining] unavailable: {mining_status.get('error', 'not configured')}", flush=True)
+        log(f"[Mining] unavailable: {mining_status.get('error', 'not configured')}")
 
     capture_worker: RollingBridgeCapture | None = None
     if not args.no_frame_capture and os.environ.get("SYSDVR_BACKGROUND_CAPTURE", "0") != "0":
@@ -362,13 +419,13 @@ def main() -> None:
             interval_seconds=float(os.environ.get("SYSDVR_CAPTURE_INTERVAL", "1.0")),
         )
         capture_worker.start()
-        print(f"SysDVR bridge frame capture writing {LATEST_FRAME}", flush=True)
+        log(f"SysDVR bridge frame capture writing {LATEST_FRAME}")
 
     httpd = ThreadingHTTPServer((args.host, args.port), OcrDevHandler)
     udp_server = UdpOcrServer(args.host, args.port)
     udp_server.start()
-    print(f"Switch OCR dev server listening on http://{args.host}:{args.port}", flush=True)
-    print(f"Switch OCR UDP server listening on udp://{args.host}:{args.port}", flush=True)
+    log(f"Switch OCR dev server listening on http://{args.host}:{args.port}")
+    log(f"Switch OCR UDP server listening on udp://{args.host}:{args.port}")
     try:
         httpd.serve_forever()
     finally:

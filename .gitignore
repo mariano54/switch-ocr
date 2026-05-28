@@ -25,6 +25,8 @@ switch/sysmodule/*.nso
 switch/sysmodule/*.nsp
 
 tmp/
+.cloudflared/
+cloudflared*.log
 
 tools/mtp_put_file
 *.backup
