@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ENDPOINT = "https://ocr.captivatelion.com/ocr-upload"
+DEFAULT_ENDPOINT = "https://ocr.example.com/ocr-upload"
 DEFAULT_KEY_ID = "switch-main"
 DEFAULT_KEYS_PATH = Path("~/.switchocr/api_keys.json").expanduser()
 DEFAULT_REMOTE_CONFIG = Path("tmp/switchocr_remote.json")

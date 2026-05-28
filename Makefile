@@ -4,9 +4,9 @@ OVERLAY_DIR := /work/switch/overlay
 SYSMODULE_DIR := /work/switch/sysmodule
 DEVKIT_IMAGE := devkitpro/devkita64
 
-MAC_IP ?= 192.168.0.124
+MAC_IP ?= 192.168.1.100
 SWITCH_IP ?=
-REMOTE_ENDPOINT ?= https://ocr.captivatelion.com/ocr-upload
+REMOTE_ENDPOINT ?= https://ocr.example.com/ocr-upload
 REMOTE_KEY_NAME ?= switch-main
 
 .PHONY: server switch-build switch-run switch-clean overlay-build overlay-clean overlay-install overlay-install-reload sysmodule-build sysmodule-clean sysmodule-install sysmodule-enable-boot switch-ocr-install tesla-hotkey-install remote-key-create remote-key-install

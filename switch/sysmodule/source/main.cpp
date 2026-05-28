@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 #ifndef SERVER_HOST
-#define SERVER_HOST "192.168.0.124"
+#define SERVER_HOST "192.168.1.100"
 #endif
 
 #ifndef SERVER_PORT
@@ -1762,6 +1762,9 @@ int curl_progress_callback(void *clientp, curl_off_t, curl_off_t, curl_off_t, cu
     if (state == nullptr || state->request_generation == 0) {
         return 0;
     }
+    if (state->request_generation != g_ocr_generation.load(std::memory_order_acquire)) {
+        return 1;
+    }
     return ocr_generation_expired(state->request_generation) || ocr_generation_timed_out(state->request_generation) ? 1 : 0;
 }
 
@@ -1890,8 +1893,9 @@ bool remote_http_request(
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_progress_callback);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progress);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
@@ -1959,6 +1963,13 @@ bool request_capssc_ocr(u32 request_generation) {
         free(jpeg);
 
         if (!curl_ok) {
+            if (request_generation != g_ocr_generation.load(std::memory_order_acquire)) {
+                return true;
+            }
+            if (ocr_generation_timed_out(request_generation) || ocr_generation_expired(request_generation)) {
+                mark_ocr_timeout(request_generation);
+                return false;
+            }
             set_status("Remote OCR upload failed; see debug.txt.");
             write_text(STATUS_PATH, g_status);
             return false;

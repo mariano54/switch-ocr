@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #ifndef SERVER_HOST
-#define SERVER_HOST "192.168.0.124"
+#define SERVER_HOST "192.168.1.100"
 #endif
 
 #ifndef SERVER_PORT
