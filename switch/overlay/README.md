@@ -1,49 +1,29 @@
 # Switch OCR Overlay
 
-The final in-game UI should live here as a Tesla/libtesla overlay.
+Tesla/libtesla HUD for Switch OCR. The overlay is a fullscreen transparent view that reads OCR and mining state from `sdmc:/config/switch-ocr/` and passes gameplay input through.
 
-Target behavior:
+The active screenshot capture and network upload path lives in the boot2 sysmodule. The overlay does not call the Mac server directly.
 
-- Open over a running game through `nx-ovlloader`.
-- Render a small translucent panel with OCR status/results.
-- Send a lightweight request to the Mac server, reusing the same protocol as the NRO prototype.
-- Avoid doing heavy OCR or video decoding on the Switch.
-
-Expected install path:
+## Install Path
 
 ```text
 sdmc:/switch/.overlays/switch-ocr.ovl
 ```
 
-Recommended iteration:
+## Controls
 
-1. Keep `switch/hello_ocr_nro` as the network/capture lab.
-2. Once the server protocol is stable, port only the UI and HTTP client code into a libtesla overlay.
-3. Use SysDVR or sys-botbase on the Mac side for reliable game-frame capture.
+- `Minus` or `Capture`: request OCR for the current frame through the sysmodule.
+- `D-Pad Left` / `D-Pad Right`: move the selected word.
+- `Right Stick`: save or sync the selected word when mining is configured.
 
-## Current Prototype
-
-The current overlay builds to:
-
-```text
-switch/overlay/switch-ocr.ovl
-```
-
-It opens as a Tesla overlay, shows a small Switch OCR menu, and calls the Mac OCR server compiled into the build with `SERVER_HOST`.
-
-Controls:
-
-- `A` on `Capture and OCR`: capture a JPEG screenshot and send it to `/ocr`.
-- `X`: shortcut for the same capture action while the overlay is open.
-
-Build:
+## Build
 
 ```sh
 /usr/bin/make overlay-build
 ```
 
-Install:
+## Install
 
-```text
-sdmc:/switch/.overlays/switch-ocr.ovl
+```sh
+/usr/bin/make overlay-install-reload
 ```

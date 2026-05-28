@@ -21,14 +21,17 @@ SERVER_PORT ?= 8742
 
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
+CURL_CONFIG := $(DEVKITPRO)/portlibs/switch/bin/curl-config
+
 CFLAGS := -g -Wall -Os -ffunction-sections -fdata-sections $(ARCH) $(DEFINES)
 CFLAGS += $(INCLUDE) -D__SWITCH__ -DSERVER_HOST=\"$(SERVER_HOST)\" -DSERVER_PORT=$(SERVER_PORT)
+CFLAGS += $(shell $(CURL_CONFIG) --cflags)
 
 CXXFLAGS := $(CFLAGS) -fno-exceptions -fno-rtti -std=c++20
 ASFLAGS := -g $(ARCH)
 LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map),--gc-sections
 
-LIBS := -lnx
+LIBS := $(shell $(CURL_CONFIG) --libs)
 LIBDIRS := $(PORTLIBS) $(LIBNX)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))

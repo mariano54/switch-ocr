@@ -41,9 +41,9 @@ struct OcrWord {
     bool selectable;
 };
 
-char g_status[512] = "Done";
-char g_result[SentenceSize] = "No OCR result yet.";
-char g_target[1024] = "No selected word yet.";
+char g_status[512] = "Switch OCR ready. Press Minus or Capture to OCR.";
+char g_result[SentenceSize] = "Welcome to Switch OCR\nMinus/Capture: OCR   Left/Right: select   R Stick: save word";
+char g_target[1024] = "Minus/Capture OCR   Left/Right select   R Stick save";
 char g_result_json[ResultJsonSize] = "";
 char g_hud_json[HudJsonSize] = "";
 char g_hud_frequency[FrequencySize] = "";

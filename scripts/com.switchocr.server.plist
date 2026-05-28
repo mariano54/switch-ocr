@@ -9,13 +9,6 @@
 
       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.switchocr.server.plist
       launchctl kickstart -k gui/$(id -u)/com.switchocr.server
-
-  Why the ssh-to-localhost wrapper?
-  SysDVR-Client needs a proper user session/terminal-like environment to
-  complete its TCP bridge handshake on macOS. Running it directly under
-  launchd (nohup, plain daemon, etc.) reliably fails. Re-entering through ssh
-  to localhost gives it the session it needs and KeepAlive restarts it if it
-  ever exits.
 -->
 <plist version="1.0">
 <dict>
@@ -33,21 +26,7 @@
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/ssh</string>
-		<string>-i</string>
-		<string>REPLACE_ME_HOME/.ssh/switchocr_local_ed25519</string>
-		<string>-o</string>
-		<string>IdentitiesOnly=yes</string>
-		<string>-o</string>
-		<string>BatchMode=yes</string>
-		<string>-o</string>
-		<string>StrictHostKeyChecking=accept-new</string>
-		<string>-o</string>
-		<string>ServerAliveInterval=30</string>
-		<string>-o</string>
-		<string>ServerAliveCountMax=3</string>
-		<string>localhost</string>
-		<string>cd "$HOME/Projects/SwitchOCR" &amp;&amp; exec ./run_server.sh</string>
+		<string>REPLACE_ME_HOME/Projects/SwitchOCR/run_server.sh</string>
 	</array>
 
 	<key>KeepAlive</key>

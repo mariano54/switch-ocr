@@ -6,8 +6,10 @@ DEVKIT_IMAGE := devkitpro/devkita64
 
 MAC_IP ?= 192.168.0.124
 SWITCH_IP ?=
+REMOTE_ENDPOINT ?= https://ocr.captivatelion.com/ocr-upload
+REMOTE_KEY_NAME ?= switch-main
 
-.PHONY: server switch-build switch-run switch-clean overlay-build overlay-clean overlay-install overlay-install-reload sysmodule-build sysmodule-clean sysmodule-install sysmodule-enable-boot switch-ocr-install tesla-hotkey-install
+.PHONY: server switch-build switch-run switch-clean overlay-build overlay-clean overlay-install overlay-install-reload sysmodule-build sysmodule-clean sysmodule-install sysmodule-enable-boot switch-ocr-install tesla-hotkey-install remote-key-create remote-key-install
 
 server:
 	python3 server/app.py --host 0.0.0.0 --port 8742
@@ -61,3 +63,9 @@ switch-ocr-install: sysmodule-install overlay-install
 
 tesla-hotkey-install: tools/mtp_put_file
 	tools/mtp_put_file 0x00010001 tmp/tesla_config.ini config/tesla/config.ini
+
+remote-key-create:
+	python3 tools/switchocr_keys.py create --name "$(REMOTE_KEY_NAME)" --endpoint "$(REMOTE_ENDPOINT)"
+
+remote-key-install:
+	python3 tools/switchocr_keys.py install-mtp

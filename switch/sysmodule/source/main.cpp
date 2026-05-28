@@ -1,4 +1,7 @@
 #include <switch.h>
+#include <switch/crypto/hmac.h>
+#include <switch/crypto/sha256.h>
+#include <curl/curl.h>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include <stb_truetype.h>
@@ -16,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef SERVER_HOST
@@ -34,6 +38,7 @@
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define HUD_PATH CONFIG_DIR "/hud.json"
 #define DEBUG_PATH CONFIG_DIR "/debug.txt"
+#define REMOTE_CONFIG_PATH CONFIG_DIR "/remote.json"
 
 extern "C" {
 extern char *fake_heap_start;
@@ -75,9 +80,16 @@ constexpr bool EnableSysmoduleViHud = false;
 constexpr size_t AlbumProbeChunkSize = 16 * 1024;
 constexpr int AlbumProbeMaxDepth = 6;
 constexpr size_t CapsscJpegBufferSize = 4 * 1024 * 1024;
-// Retain the old SysDVR/latest-frame OCR path, but do not use it by default.
-constexpr bool UseSysDvrOcrFallback = false;
 constexpr bool UploadScreenshotProbeWithOcr = false;
+constexpr size_t RemoteEndpointSize = 256;
+constexpr size_t RemoteKeyIdSize = 64;
+constexpr size_t RemoteSecretSize = 96;
+constexpr size_t RemotePathSize = 128;
+constexpr int LanUploadSendTimeoutSec = 20;
+constexpr int LanUploadReceiveTimeoutSec = 22;
+constexpr const char *StartupStatusText = "Switch OCR ready. Press Minus or Capture to OCR.";
+constexpr const char *StartupResultText = "Welcome to Switch OCR\nMinus/Capture: OCR   Left/Right: select   R Stick: save word";
+constexpr const char *StartupTargetText = "Minus/Capture OCR   Left/Right select   R Stick save";
 
 struct OcrWord {
     char surface[SurfaceSize];
@@ -106,6 +118,23 @@ struct AlbumProbeFile {
     off_t size;
 };
 
+struct RemoteConfig {
+    char endpoint[RemoteEndpointSize];
+    char key_id[RemoteKeyIdSize];
+    char secret[RemoteSecretSize];
+    char path[RemotePathSize];
+};
+
+struct CurlResponseBuffer {
+    char *data;
+    size_t size;
+    size_t capacity;
+};
+
+struct CurlProgressState {
+    u32 request_generation;
+};
+
 struct Color {
     union {
         struct {
@@ -125,9 +154,9 @@ char g_heap[0x900000];
 char g_request[256];
 char g_last_request[256];
 char g_response[ResponseSize];
-char g_status[512] = "Switch OCR HUD ready. Press Minus to OCR.";
+char g_status[512] = "Switch OCR ready. Press Minus or Capture to OCR.";
 char g_mining_status[160] = "Mining sync pending.";
-char g_sentence[SentenceSize] = "No OCR result yet.";
+char g_sentence[SentenceSize] = "Welcome to Switch OCR\nMinus/Capture: OCR   Left/Right: select   R Stick: save word";
 OcrWord g_words[MaxWords] = {};
 char g_saved_word_keys[MaxSavedWords][BaseSize] = {};
 char g_mining_response[ResponseSize] = "";
@@ -148,6 +177,7 @@ bool g_capture_button_initialized = false;
 bool g_pl_initialized = false;
 bool g_hos_version_initialized = false;
 bool g_socket_driver_initialized = false;
+bool g_curl_initialized = false;
 bool g_nifm_initialized = false;
 bool g_nifm_request_ready = false;
 NifmRequest g_nifm_request = {};
@@ -736,6 +766,30 @@ void write_target_line() {
     format_selected_word_line(line, sizeof(line));
     write_text(TARGET_PATH, line);
     write_hud_state();
+}
+
+void reset_startup_hud_state() {
+    g_ocr_pending.store(false, std::memory_order_release);
+    g_ocr_requested.store(false, std::memory_order_release);
+    g_ocr_started_tick.store(0, std::memory_order_release);
+    g_word_count = 0;
+    g_selected_word = -1;
+    copy_text(g_sentence, sizeof(g_sentence), StartupResultText);
+    set_status(StartupStatusText);
+    write_text(STATUS_PATH, g_status);
+    write_text(RESULT_PATH, g_sentence);
+    write_text(RESULT_JSON_PATH, "");
+    write_text(TARGET_PATH, StartupTargetText);
+    write_hud_state();
+}
+
+void baseline_startup_request_file() {
+    if (read_text(REQUEST_PATH, g_last_request, sizeof(g_last_request))) {
+        copy_text(g_request, sizeof(g_request), g_last_request);
+        return;
+    }
+    g_request[0] = '\0';
+    g_last_request[0] = '\0';
 }
 
 void set_ocr_error_state(const char *status, const char *result) {
@@ -1580,6 +1634,290 @@ size_t expected_http_response_size(const char *response, size_t used) {
     return total_size <= sizeof(g_response) ? total_size : used;
 }
 
+void bytes_to_hex(const u8 *bytes, size_t size, char *out, size_t out_size) {
+    static constexpr char Hex[] = "0123456789abcdef";
+    if (out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    size_t used = 0;
+    for (size_t i = 0; i < size && used + 2 < out_size; i++) {
+        out[used++] = Hex[(bytes[i] >> 4) & 0xF];
+        out[used++] = Hex[bytes[i] & 0xF];
+        out[used] = '\0';
+    }
+}
+
+void sha256_hex(const void *body, size_t body_size, char *out, size_t out_size) {
+    u8 hash[0x20];
+    sha256CalculateHash(hash, body, body_size);
+    bytes_to_hex(hash, sizeof(hash), out, out_size);
+}
+
+void hmac_sha256_hex(const char *secret, const char *message, char *out, size_t out_size) {
+    u8 mac[0x20];
+    hmacSha256CalculateMac(mac, secret, strlen(secret), message, strlen(message));
+    bytes_to_hex(mac, sizeof(mac), out, out_size);
+}
+
+bool generate_nonce(char *out, size_t out_size) {
+    u8 bytes[16];
+    Result rc = csrngInitialize();
+    if (R_FAILED(rc)) {
+        char debug[96];
+        snprintf(debug, sizeof(debug), "Remote auth: csrng init failed 0x%x", rc);
+        write_debug(debug);
+        return false;
+    }
+    rc = csrngGetRandomBytes(bytes, sizeof(bytes));
+    csrngExit();
+    if (R_FAILED(rc)) {
+        char debug[96];
+        snprintf(debug, sizeof(debug), "Remote auth: nonce failed 0x%x", rc);
+        write_debug(debug);
+        return false;
+    }
+    bytes_to_hex(bytes, sizeof(bytes), out, out_size);
+    return out[0] != '\0';
+}
+
+bool extract_url_path(const char *endpoint, char *out, size_t out_size) {
+    const char *host_start = strstr(endpoint, "://");
+    if (host_start == nullptr) {
+        return false;
+    }
+    host_start += 3;
+    const char *path_start = strchr(host_start, '/');
+    copy_text(out, out_size, path_start != nullptr && path_start[0] != '\0' ? path_start : "/");
+    return out[0] != '\0';
+}
+
+bool remote_config_for_path(const RemoteConfig &base, const char *path, RemoteConfig &out) {
+    out = base;
+    const char *scheme = strstr(base.endpoint, "://");
+    if (scheme == nullptr || path == nullptr || path[0] != '/') {
+        return false;
+    }
+    const char *host_start = scheme + 3;
+    const char *path_start = strchr(host_start, '/');
+    const size_t origin_size = path_start != nullptr ? static_cast<size_t>(path_start - base.endpoint) : strlen(base.endpoint);
+    if (origin_size + strlen(path) + 1 >= sizeof(out.endpoint)) {
+        return false;
+    }
+    memcpy(out.endpoint, base.endpoint, origin_size);
+    out.endpoint[origin_size] = '\0';
+    append_text(out.endpoint, sizeof(out.endpoint), path);
+    copy_text(out.path, sizeof(out.path), path);
+    return true;
+}
+
+bool load_remote_config(RemoteConfig &config) {
+    char json[768];
+    if (!read_text(REMOTE_CONFIG_PATH, json, sizeof(json))) {
+        return false;
+    }
+    const char *end = json + strlen(json);
+    if (!parse_json_field(json, end, "endpoint", config.endpoint, sizeof(config.endpoint)) ||
+        !parse_json_field(json, end, "key_id", config.key_id, sizeof(config.key_id)) ||
+        !parse_json_field(json, end, "secret", config.secret, sizeof(config.secret)) ||
+        !extract_url_path(config.endpoint, config.path, sizeof(config.path))) {
+        write_debug("Remote config invalid.");
+        return false;
+    }
+    return strncmp(config.endpoint, "https://", 8) == 0;
+}
+
+bool init_curl_driver() {
+    if (g_curl_initialized) {
+        return true;
+    }
+    if (!init_socket_driver()) {
+        return false;
+    }
+    const CURLcode rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (rc != CURLE_OK) {
+        char debug[128];
+        snprintf(debug, sizeof(debug), "curl init failed: %d", static_cast<int>(rc));
+        write_debug(debug);
+        return false;
+    }
+    g_curl_initialized = true;
+    return true;
+}
+
+size_t curl_write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    CurlResponseBuffer *buffer = static_cast<CurlResponseBuffer *>(userdata);
+    const size_t bytes = size * nmemb;
+    if (buffer == nullptr || buffer->size + bytes + 1 > buffer->capacity) {
+        return 0;
+    }
+    memcpy(buffer->data + buffer->size, ptr, bytes);
+    buffer->size += bytes;
+    buffer->data[buffer->size] = '\0';
+    return bytes;
+}
+
+int curl_progress_callback(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    CurlProgressState *state = static_cast<CurlProgressState *>(clientp);
+    if (state == nullptr || state->request_generation == 0) {
+        return 0;
+    }
+    return ocr_generation_expired(state->request_generation) || ocr_generation_timed_out(state->request_generation) ? 1 : 0;
+}
+
+bool build_auth_headers(
+    const RemoteConfig &config,
+    const char *method,
+    const void *body,
+    size_t body_size,
+    char *key_header,
+    size_t key_header_size,
+    char *timestamp_header,
+    size_t timestamp_header_size,
+    char *nonce_header,
+    size_t nonce_header_size,
+    char *body_hash_header,
+    size_t body_hash_header_size,
+    char *signature_header,
+    size_t signature_header_size
+) {
+    char timestamp[24];
+    snprintf(timestamp, sizeof(timestamp), "%lld", static_cast<long long>(time(nullptr)));
+
+    char nonce[40];
+    if (!generate_nonce(nonce, sizeof(nonce))) {
+        return false;
+    }
+
+    char body_hash[80];
+    sha256_hex(body, body_size, body_hash, sizeof(body_hash));
+
+    char canonical[512];
+    const int canonical_size = snprintf(
+        canonical,
+        sizeof(canonical),
+        "SWITCHOCR-HMAC-SHA256\n%s\n%s\n%s\n%s\n%s",
+        method,
+        config.path,
+        timestamp,
+        nonce,
+        body_hash
+    );
+    if (canonical_size <= 0 || static_cast<size_t>(canonical_size) >= sizeof(canonical)) {
+        return false;
+    }
+
+    char signature[80];
+    hmac_sha256_hex(config.secret, canonical, signature, sizeof(signature));
+
+    snprintf(key_header, key_header_size, "X-SwitchOCR-Key-Id: %s", config.key_id);
+    snprintf(timestamp_header, timestamp_header_size, "X-SwitchOCR-Timestamp: %s", timestamp);
+    snprintf(nonce_header, nonce_header_size, "X-SwitchOCR-Nonce: %s", nonce);
+    snprintf(body_hash_header, body_hash_header_size, "X-SwitchOCR-Content-SHA256: %s", body_hash);
+    snprintf(signature_header, signature_header_size, "X-SwitchOCR-Signature: %s", signature);
+    return true;
+}
+
+bool remote_http_request(
+    const RemoteConfig &config,
+    const char *method,
+    const char *content_type,
+    const void *body,
+    size_t body_size,
+    char *response,
+    size_t response_size,
+    long &http_status,
+    u32 request_generation = 0
+) {
+    if (!init_curl_driver() || response_size == 0) {
+        return false;
+    }
+    ensure_nifm_request_ready();
+    const void *request_body = body != nullptr ? body : "";
+    const size_t request_body_size = body != nullptr ? body_size : 0;
+
+    char key_header[112];
+    char timestamp_header[72];
+    char nonce_header[96];
+    char body_hash_header[120];
+    char signature_header[120];
+    if (!build_auth_headers(
+            config,
+            method,
+            request_body,
+            request_body_size,
+            key_header,
+            sizeof(key_header),
+            timestamp_header,
+            sizeof(timestamp_header),
+            nonce_header,
+            sizeof(nonce_header),
+            body_hash_header,
+            sizeof(body_hash_header),
+            signature_header,
+            sizeof(signature_header)
+        )) {
+        return false;
+    }
+
+    CURL *curl = curl_easy_init();
+    if (curl == nullptr) {
+        return false;
+    }
+
+    CurlResponseBuffer buffer = {response, 0, response_size};
+    response[0] = '\0';
+
+    struct curl_slist *headers = nullptr;
+    char content_type_header[80];
+    snprintf(content_type_header, sizeof(content_type_header), "Content-Type: %s", content_type != nullptr ? content_type : "application/json");
+    headers = curl_slist_append(headers, content_type_header);
+    headers = curl_slist_append(headers, "Accept: application/json");
+    if (content_type != nullptr && strcmp(content_type, "image/jpeg") == 0) {
+        headers = curl_slist_append(headers, "X-SwitchOCR-Source: capssc");
+    }
+    headers = curl_slist_append(headers, key_header);
+    headers = curl_slist_append(headers, timestamp_header);
+    headers = curl_slist_append(headers, nonce_header);
+    headers = curl_slist_append(headers, body_hash_header);
+    headers = curl_slist_append(headers, signature_header);
+
+    CurlProgressState progress = {request_generation};
+    curl_easy_setopt(curl, CURLOPT_URL, config.endpoint);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_progress_callback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progress);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+
+    if (strcmp(method, "GET") == 0) {
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(request_body_size));
+    }
+
+    CURLcode rc = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK) {
+        char debug[160];
+        snprintf(debug, sizeof(debug), "curl request failed: %d", static_cast<int>(rc));
+        write_debug(debug);
+        return false;
+    }
+    return true;
+}
+
 bool request_capssc_ocr(u32 request_generation) {
     set_status("Capturing Switch screenshot for OCR.");
     write_text(STATUS_PATH, g_status);
@@ -1602,6 +1940,49 @@ bool request_capssc_ocr(u32 request_generation) {
         return false;
     }
 
+    RemoteConfig remote = {};
+    if (load_remote_config(remote)) {
+        set_status("Uploading Switch screenshot over HTTPS.");
+        write_text(STATUS_PATH, g_status);
+        long http_status = 0;
+        const bool curl_ok = remote_http_request(
+            remote,
+            "POST",
+            "image/jpeg",
+            jpeg,
+            jpeg_size,
+            g_response,
+            sizeof(g_response),
+            http_status,
+            request_generation
+        );
+        free(jpeg);
+
+        if (!curl_ok) {
+            set_status("Remote OCR upload failed; see debug.txt.");
+            write_text(STATUS_PATH, g_status);
+            return false;
+        }
+        write_text(RESULT_JSON_PATH, g_response);
+        if (request_generation != g_ocr_generation.load(std::memory_order_acquire)) {
+            return true;
+        }
+        if (ocr_generation_timed_out(request_generation) || ocr_generation_expired(request_generation)) {
+            mark_ocr_timeout(request_generation);
+            return false;
+        }
+        if (http_status < 200 || http_status >= 300) {
+            char display_text[SentenceSize];
+            char status[128];
+            copy_json_error_text(g_response, display_text, sizeof(display_text));
+            snprintf(status, sizeof(status), "Remote OCR failed: HTTP %ld.", http_status);
+            set_ocr_error_state(status, display_text);
+            return true;
+        }
+        apply_ocr_response(g_response);
+        return true;
+    }
+
     if (!init_socket_driver()) {
         free(jpeg);
         return false;
@@ -1617,10 +1998,13 @@ bool request_capssc_ocr(u32 request_generation) {
     }
     g_active_ocr_socket.store(sock, std::memory_order_release);
 
-    timeval timeout = {};
-    timeout.tv_sec = 8;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    timeval send_timeout = {};
+    send_timeout.tv_sec = LanUploadSendTimeoutSec;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+
+    timeval receive_timeout = {};
+    receive_timeout.tv_sec = LanUploadReceiveTimeoutSec;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -1771,189 +2155,11 @@ bool request_capssc_ocr(u32 request_generation) {
     return true;
 }
 
-bool request_latest_ocr(u32 request_generation) {
-    if (!init_socket_driver()) {
-        return false;
-    }
-
-    const bool nifm_ready = ensure_nifm_request_ready();
-    NifmRequestState nifm_state = NifmRequestState_Invalid;
-    Result nifm_state_rc = 0;
-    Result nifm_request_rc = 0;
-    if (nifm_ready) {
-        nifm_state_rc = nifmGetRequestState(&g_nifm_request, &nifm_state);
-        nifm_request_rc = nifmGetResult(&g_nifm_request);
-    }
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        snprintf(
-            g_status,
-            sizeof(g_status),
-            "TCP socket failed: errno=%d result=0x%x",
-            errno,
-            socketGetLastResult()
-        );
-        write_text(STATUS_PATH, g_status);
-        return false;
-    }
-    g_active_ocr_socket.store(sock, std::memory_order_release);
-
-    bool socket_registered = false;
-    int register_errno = 0;
-    Result register_result = 0;
-    if (nifm_ready) {
-        if (socketNifmRequestRegisterSocketDescriptor(&g_nifm_request, sock) == 0) {
-            socket_registered = true;
-        } else {
-            register_errno = errno;
-            register_result = socketGetLastResult();
-        }
-    }
-
-    sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(SERVER_PORT);
-    if (inet_pton(AF_INET, SERVER_HOST, &addr.sin_addr) != 1) {
-        if (socket_registered) {
-            socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
-        }
-        close(sock);
-        g_active_ocr_socket.store(-1, std::memory_order_release);
-        set_status("Invalid OCR server IP.");
-        write_text(STATUS_PATH, g_status);
-        return false;
-    }
-
-    snprintf(
-        g_status,
-        sizeof(g_status),
-        "TCP connect: nifm=%d state=%d state_rc=0x%x req=0x%x reg_errno=%d reg=0x%x",
-        nifm_ready ? 1 : 0,
-        nifm_state,
-        nifm_state_rc,
-        nifm_request_rc,
-        register_errno,
-        register_result
-    );
-    write_text(STATUS_PATH, g_status);
-    if (!wait_for_tcp_connection(sock)) {
-        if (socket_registered) {
-            socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
-        }
-        close(sock);
-        g_active_ocr_socket.store(-1, std::memory_order_release);
-        snprintf(
-            g_status,
-            sizeof(g_status),
-            "TCP connect failed: errno=%d result=0x%x nifm_state=%d reg_errno=%d reg=0x%x",
-            errno,
-            socketGetLastResult(),
-            nifm_state,
-            register_errno,
-            register_result
-        );
-        write_text(STATUS_PATH, g_status);
-        return false;
-    }
-
-    const char *body = "{}";
-    char header[512];
-    const int header_size = snprintf(
-        header,
-        sizeof(header),
-        "POST /ocr-latest HTTP/1.1\r\n"
-        "Host: %s:%d\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: 2\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        SERVER_HOST,
-        SERVER_PORT
-    );
-
-    if (header_size < 0 || static_cast<size_t>(header_size) >= sizeof(header) ||
-        send(sock, header, static_cast<size_t>(header_size), 0) < 0 ||
-        send(sock, body, strlen(body), 0) < 0) {
-        if (socket_registered) {
-            socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
-        }
-        close(sock);
-        g_active_ocr_socket.store(-1, std::memory_order_release);
-        snprintf(g_status, sizeof(g_status), "TCP send failed: errno=%d result=0x%x", errno, socketGetLastResult());
-        write_text(STATUS_PATH, g_status);
-        return false;
-    }
-
-    set_status("TCP OCR request sent. Waiting for Mac...");
-    write_text(STATUS_PATH, g_status);
-
-    size_t used = 0;
-    int receive_errno = 0;
-    while (used + 1 < sizeof(g_response)) {
-        ssize_t received = recv(sock, g_response + used, sizeof(g_response) - used - 1, 0);
-        if (received < 0) {
-            receive_errno = errno;
-            if (used > 0) {
-                break;
-            }
-            if (socket_registered) {
-                socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
-            }
-            close(sock);
-            g_active_ocr_socket.store(-1, std::memory_order_release);
-            snprintf(g_status, sizeof(g_status), "TCP receive failed: errno=%d result=0x%x", errno, socketGetLastResult());
-            write_text(STATUS_PATH, g_status);
-            return false;
-        }
-        if (received == 0) {
-            break;
-        }
-        used += static_cast<size_t>(received);
-        g_response[used] = '\0';
-
-        const size_t expected_size = expected_http_response_size(g_response, used);
-        if (expected_size > 0 && used >= expected_size) {
-            break;
-        }
-    }
-    g_response[used] = '\0';
-
-    if (socket_registered) {
-        socketNifmRequestUnregisterSocketDescriptor(&g_nifm_request, sock);
-    }
-    close(sock);
-    g_active_ocr_socket.store(-1, std::memory_order_release);
-
-    char *body_text = strstr(g_response, "\r\n\r\n");
-    if (body_text == nullptr) {
-        snprintf(g_status, sizeof(g_status), "Bad HTTP response: %zu bytes errno=%d", used, receive_errno);
-        write_text(STATUS_PATH, g_status);
-        return false;
-    }
-    body_text += 4;
-
-    if (request_generation != g_ocr_generation.load(std::memory_order_acquire)) {
-        return true;
-    }
-    if (ocr_generation_timed_out(request_generation) || ocr_generation_expired(request_generation)) {
-        mark_ocr_timeout(request_generation);
-        return false;
-    }
-
-    const int http_status = parse_http_status(g_response);
-    if (http_status < 200 || http_status >= 300) {
-        char display_text[SentenceSize];
-        char status[128];
-        copy_json_error_text(body_text, display_text, sizeof(display_text));
-        snprintf(status, sizeof(status), "OCR request failed: HTTP %d.", http_status);
-        write_text(RESULT_JSON_PATH, body_text);
-        set_ocr_error_state(status, display_text);
-        return true;
-    }
-
-    apply_ocr_response(body_text);
-    return true;
+bool first_ocr_retry_allowed(u32 request_generation) {
+    return request_generation == 1 &&
+           request_generation == g_ocr_generation.load(std::memory_order_acquire) &&
+           !ocr_generation_timed_out(request_generation) &&
+           !ocr_generation_expired(request_generation);
 }
 
 void ocr_worker_entry(void *) {
@@ -1968,8 +2174,13 @@ void ocr_worker_entry(void *) {
         g_ocr_worker_busy.store(true, std::memory_order_release);
         handled_generation = desired_generation;
         bool request_ok = request_capssc_ocr(handled_generation);
-        if (!request_ok && UseSysDvrOcrFallback) {
-            request_ok = request_latest_ocr(handled_generation);
+        if (!request_ok && first_ocr_retry_allowed(handled_generation)) {
+            set_status("Retrying first OCR warmup.");
+            write_text(STATUS_PATH, g_status);
+            svcSleepThread(300000000);
+            if (first_ocr_retry_allowed(handled_generation)) {
+                request_ok = request_capssc_ocr(handled_generation);
+            }
         }
         if (!request_ok) {
             if (handled_generation == g_ocr_generation.load(std::memory_order_acquire)) {
@@ -2189,6 +2400,27 @@ bool build_mine_word_body(const OcrWord &word, char *out, size_t out_size) {
 }
 
 bool request_server_json(const char *method, const char *path, const char *body, char *body_out, size_t body_out_size) {
+    RemoteConfig base_remote = {};
+    RemoteConfig remote = {};
+    if (load_remote_config(base_remote) && remote_config_for_path(base_remote, path, remote)) {
+        long http_status = 0;
+        const char *request_body = body != nullptr ? body : "";
+        const bool ok = remote_http_request(
+            remote,
+            method,
+            "application/json",
+            request_body,
+            strlen(request_body),
+            g_mining_response,
+            sizeof(g_mining_response),
+            http_status
+        );
+        if (body_out_size > 0) {
+            snprintf(body_out, body_out_size, "%s", ok ? g_mining_response : "");
+        }
+        return ok && http_status >= 200 && http_status < 300;
+    }
+
     if (!init_socket_driver()) {
         return false;
     }
@@ -2918,12 +3150,14 @@ int main(int argc, char **argv) {
 
     mkdir("sdmc:/config", 0777);
     mkdir(CONFIG_DIR, 0777);
-    set_status("Switch OCR sysmodule polling requests.");
-    write_text(STATUS_PATH, g_status);
-    write_text(TARGET_PATH, "No definition");
-    write_hud_state();
+    baseline_startup_request_file();
+    reset_startup_hud_state();
     start_ocr_worker();
     start_screenshot_probe_worker();
+    if (init_socket_driver()) {
+        ensure_nifm_request_ready();
+    }
+    reset_startup_hud_state();
     if (start_mining_worker()) {
         queue_mining_status_request("startup");
     }
