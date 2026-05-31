@@ -755,12 +755,12 @@ public:
 
             constexpr s32 panel_x = 0;
             constexpr s32 panel_w = 1280;
-            constexpr s32 panel_h = 84;
-            const s32 panel_y = g_position_top ? 0 : 636;
+            constexpr s32 panel_h = 108;
+            const s32 panel_y = g_position_top ? 0 : 720 - panel_h;
             renderer->drawRect(panel_x, panel_y, panel_w, panel_h, tsl::Color(0, 0, 0, 11));
 
-            drawParagraph(renderer, panel_x + 16, panel_y + 26, panel_w - 32);
-            drawTargetRow(renderer, panel_x + 16, panel_y + 54, panel_w - 32);
+            drawParagraph(renderer, panel_x + 16, panel_y + 34, panel_w - 32);
+            drawTargetRow(renderer, panel_x + 16, panel_y + 82, panel_w - 32);
             drawStatusToggles(renderer, panel_x, panel_y, panel_w);
         }
 
@@ -774,7 +774,8 @@ public:
 
     private:
         static constexpr float ParagraphFontSize = 18.0F;
-        static constexpr s32 ParagraphLineHeight = 15;
+        static constexpr float FuriganaFontSize = 10.0F;
+        static constexpr s32 ParagraphLineHeight = 25;
         static constexpr s32 HighlightHeight = 22;
         static constexpr s32 HighlightYOffset = 18;
 
@@ -908,7 +909,7 @@ public:
             if (g_word_count == 0) {
                 char loading[16];
                 compactSpinner("OCR", loading, sizeof(loading));
-                drawPlainParagraph(renderer, ocrLoading() ? loading : g_result, x, y, maxWidth);
+                drawPlainParagraph(renderer, ocrLoading() ? g_status : g_result, x, y, maxWidth);
                 return;
             }
 
@@ -933,6 +934,20 @@ public:
                 }
 
                 const bool selected = static_cast<int>(i) == g_selected_word;
+                if (word.reading[0] != '\0' && strcmp(word.reading, surface) != 0) {
+                    const s32 readingWidth = measureText(renderer, word.reading, FuriganaFontSize);
+                    const s32 readingX = cursorX + ((wordWidth - readingWidth) / 2);
+                    drawText(
+                        renderer,
+                        word.reading,
+                        readingX > x ? readingX : cursorX,
+                        cursorY - 16,
+                        FuriganaFontSize,
+                        selected ? tsl::Color(11, 15, 12, 15) : tsl::Color(10, 12, 10, 15),
+                        maxWidth - (cursorX - x),
+                        false
+                    );
+                }
                 if (selected && wordWidth > 0) {
                     renderer->drawRect(cursorX - 2, cursorY - HighlightYOffset, wordWidth + 4, HighlightHeight, tsl::Color(0, 15, 13, 7));
                 }
@@ -1136,7 +1151,8 @@ public:
             if (ocrLoading()) {
                 char loading[16];
                 compactSpinner("OCR", loading, sizeof(loading));
-                drawText(renderer, loading, x, y, 22.0F, tsl::Color(15, 9, 2, 15), leftMax);
+                const char *target = g_target[0] != '\0' && strcmp(g_target, "Loading...") != 0 ? g_target : loading;
+                drawText(renderer, target, x, y, 19.0F, tsl::Color(15, 9, 2, 15), leftMax);
                 return;
             }
 

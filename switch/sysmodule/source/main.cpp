@@ -800,6 +800,13 @@ void write_target_line() {
     write_hud_state();
 }
 
+void set_ocr_stage(const char *status, const char *target) {
+    set_status(status);
+    write_text(STATUS_PATH, g_status);
+    write_text(TARGET_PATH, target);
+    write_hud_state();
+}
+
 void reset_startup_hud_state() {
     g_ocr_pending.store(false, std::memory_order_release);
     g_ocr_requested.store(false, std::memory_order_release);
@@ -1959,8 +1966,7 @@ bool remote_http_request(
 }
 
 bool request_capssc_ocr(u32 request_generation) {
-    set_status("Capturing Switch screenshot for OCR.");
-    write_text(STATUS_PATH, g_status);
+    set_ocr_stage("Capturing Switch screenshot for OCR.", "Capturing screenshot...");
 
     void *jpeg = nullptr;
     size_t jpeg_size = 0;
@@ -1982,8 +1988,7 @@ bool request_capssc_ocr(u32 request_generation) {
 
     RemoteConfig remote = {};
     if (load_remote_config(remote)) {
-        set_status("Uploading Switch screenshot over HTTPS.");
-        write_text(STATUS_PATH, g_status);
+        set_ocr_stage("Uploading Switch screenshot over HTTPS.", "Uploading screenshot...");
         long http_status = 0;
         const bool curl_ok = remote_http_request(
             remote,
@@ -2011,6 +2016,7 @@ bool request_capssc_ocr(u32 request_generation) {
             return false;
         }
         write_text(RESULT_JSON_PATH, g_response);
+        set_ocr_stage("Received OCR response from server.", "Parsing OCR response...");
         if (request_generation != g_ocr_generation.load(std::memory_order_acquire)) {
             return true;
         }
@@ -2138,8 +2144,7 @@ bool request_capssc_ocr(u32 request_generation) {
     }
     free(jpeg);
 
-    set_status("Switch screenshot uploaded. Waiting for OCR...");
-    write_text(STATUS_PATH, g_status);
+    set_ocr_stage("Switch screenshot uploaded. Waiting for OCR...", "Waiting for OCR response...");
 
     size_t used = 0;
     int receive_errno = 0;
