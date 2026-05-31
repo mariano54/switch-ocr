@@ -59,7 +59,6 @@ def enrich_words(words: list[OcrWord]) -> list[OcrWord]:
             entry = jmdict_matches.get(term)
             if entry is not None:
                 output["b"] = output.get("b") or entry.term
-                output["t"] = "; ".join(entry.definitions)[:220]
                 break
 
         for term in word_terms:
