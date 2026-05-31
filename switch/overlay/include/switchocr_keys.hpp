@@ -145,6 +145,26 @@ inline KeyBindings parseBindings(const char *json) {
     return bindings;
 }
 
+// Button combo (handled by the overlay) that opens the Tesla settings menu.
+inline constexpr const char *kSettingsComboLabel = "ZL+ZR+Up";
+
+// Builds the idle/intro help shown on the HUD. Split across the paragraph row
+// (actions) and the target row (settings) so it fits the compact panel.
+inline void formatHelpResult(const KeyBindings &bindings, char *out, size_t outSize) {
+    snprintf(out, outSize,
+             "Switch OCR ready.  %s/Capture: OCR    %s/%s: select    %s: save word",
+             nameForMask(bindings.mask[Action_Ocr]),
+             nameForMask(bindings.mask[Action_Left]),
+             nameForMask(bindings.mask[Action_Right]),
+             nameForMask(bindings.mask[Action_Mine]));
+}
+
+inline void formatHelpTarget(char *out, size_t outSize) {
+    snprintf(out, outSize,
+             "%s: settings  (live HUD on/off, screen top/bottom, remap keys)",
+             kSettingsComboLabel);
+}
+
 inline void serializeBindings(const KeyBindings &bindings, char *out, size_t outSize) {
     snprintf(out, outSize,
              "{\"ocr\":\"%s\",\"mine\":\"%s\",\"left\":\"%s\",\"right\":\"%s\"}\n",

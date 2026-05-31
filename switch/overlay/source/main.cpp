@@ -45,9 +45,9 @@ struct OcrWord {
     bool selectable;
 };
 
-char g_status[512] = "Switch OCR ready. Press Minus or Capture to OCR.";
-char g_result[SentenceSize] = "Welcome to Switch OCR\nMinus/Capture: OCR   Left/Right: select   R Stick: save word";
-char g_target[1024] = "Minus/Capture OCR   Left/Right select   R Stick save";
+char g_status[512] = "Switch OCR ready.";
+char g_result[SentenceSize] = "Switch OCR ready.";
+char g_target[1024] = "";
 char g_result_json[ResultJsonSize] = "";
 char g_hud_json[HudJsonSize] = "";
 char g_hud_frequency[FrequencySize] = "";
@@ -693,6 +693,8 @@ class SwitchOcrGui final : public tsl::Gui {
 public:
     tsl::elm::Element *createUI() override {
         loadSettings();
+        switchocr::formatHelpResult(g_bindings, g_result, sizeof(g_result));
+        switchocr::formatHelpTarget(g_target, sizeof(g_target));
         refreshDisplayFiles();
         return new HudElement();
     }

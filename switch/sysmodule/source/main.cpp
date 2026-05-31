@@ -90,9 +90,7 @@ constexpr size_t RemoteSecretSize = 96;
 constexpr size_t RemotePathSize = 128;
 constexpr int LanUploadSendTimeoutSec = 20;
 constexpr int LanUploadReceiveTimeoutSec = 22;
-constexpr const char *StartupStatusText = "Switch OCR ready. Press Minus or Capture to OCR.";
-constexpr const char *StartupResultText = "Welcome to Switch OCR\nMinus/Capture: OCR   Left/Right: select   R Stick: save word";
-constexpr const char *StartupTargetText = "Minus/Capture OCR   Left/Right select   R Stick save";
+constexpr const char *StartupStatusText = "Switch OCR ready.";
 
 struct OcrWord {
     char surface[SurfaceSize];
@@ -807,12 +805,16 @@ void reset_startup_hud_state() {
     g_ocr_started_tick.store(0, std::memory_order_release);
     g_word_count = 0;
     g_selected_word = -1;
-    copy_text(g_sentence, sizeof(g_sentence), StartupResultText);
+    char result[SentenceSize];
+    char target[640];
+    switchocr::formatHelpResult(g_keys, result, sizeof(result));
+    switchocr::formatHelpTarget(target, sizeof(target));
+    copy_text(g_sentence, sizeof(g_sentence), result);
     set_status(StartupStatusText);
     write_text(STATUS_PATH, g_status);
     write_text(RESULT_PATH, g_sentence);
     write_text(RESULT_JSON_PATH, "");
-    write_text(TARGET_PATH, StartupTargetText);
+    write_text(TARGET_PATH, target);
     write_hud_state();
 }
 
