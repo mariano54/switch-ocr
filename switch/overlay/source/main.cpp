@@ -648,6 +648,22 @@ public:
             list->addItem(item);
         }
 
+        auto *reset = new tsl::elm::ListItem("Reset key bindings to defaults");
+        reset->setClickListener([this](u64 keys) {
+            if ((keys & HidNpadButton_A) && m_capturing < 0) {
+                g_bindings = switchocr::defaultBindings();
+                saveKeyBindings();
+                for (int action = 0; action < switchocr::Action_Count; action++) {
+                    if (m_remapItems[action] != nullptr) {
+                        m_remapItems[action]->setValue(switchocr::nameForMask(g_bindings.mask[action]));
+                    }
+                }
+                return true;
+            }
+            return false;
+        });
+        list->addItem(reset);
+
         frame->setContent(list);
         return frame;
     }
