@@ -635,7 +635,9 @@ public:
             item->setValue(switchocr::nameForMask(g_bindings.mask[action]));
             m_remapItems[action] = item;
             item->setClickListener([this, action](u64 keys) {
-                if (keys & HidNpadButton_A) {
+                // Only start capture when not already capturing, otherwise the A
+                // press meant to bind A would just restart capture instead.
+                if ((keys & HidNpadButton_A) && m_capturing < 0) {
                     m_capturing = action;
                     m_captureArmed = false;
                     m_remapItems[action]->setValue("Press button...");

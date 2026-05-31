@@ -53,6 +53,14 @@ inline const ButtonInfo kButtons[] = {
     {"Down",   HidNpadButton_Down},
     {"Left",   HidNpadButton_Left},
     {"Right",  HidNpadButton_Right},
+    {"LS-Up",    HidNpadButton_StickLUp},
+    {"LS-Down",  HidNpadButton_StickLDown},
+    {"LS-Left",  HidNpadButton_StickLLeft},
+    {"LS-Right", HidNpadButton_StickLRight},
+    {"RS-Up",    HidNpadButton_StickRUp},
+    {"RS-Down",  HidNpadButton_StickRDown},
+    {"RS-Left",  HidNpadButton_StickRLeft},
+    {"RS-Right", HidNpadButton_StickRRight},
 };
 
 inline constexpr size_t kButtonCount = sizeof(kButtons) / sizeof(kButtons[0]);
