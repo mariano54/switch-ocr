@@ -17,7 +17,9 @@
 #define TARGET_PATH CONFIG_DIR "/target.txt"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define HUD_PATH CONFIG_DIR "/hud.json"
+#define INPUT_STATE_PATH CONFIG_DIR "/input-state.json"
 #define KEYS_PATH CONFIG_DIR "/keys.json"
+#define SETTINGS_PATH CONFIG_DIR "/settings.json"
 #define GAMES_DIR CONFIG_DIR "/games"
 
 namespace {
@@ -30,7 +32,7 @@ constexpr size_t DefinitionSize = 384;
 constexpr size_t FrequencySize = 32;
 constexpr size_t KanjiSize = 128;
 constexpr size_t SentenceSize = 2048;
-constexpr size_t ResultJsonSize = 12000;
+constexpr size_t ResultJsonSize = 65536;
 constexpr size_t HudJsonSize = 1024;
 constexpr size_t MiningStatusSize = 160;
 
@@ -68,6 +70,8 @@ bool g_sd_mounted = false;
 
 u64 g_program_id = 0;
 bool g_passthrough = true;
+bool g_ignore_keys_in_passthrough = true;
+bool g_ocr_after_focus = false;
 bool g_position_top = false;
 int g_hud_opacity = 11;
 switchocr::KeyBindings g_bindings = switchocr::defaultBindings();
@@ -525,7 +529,7 @@ void refreshDisplayFiles() {
     if (readText(TARGET_PATH, target, sizeof(target))) {
         copyText(g_target, sizeof(g_target), target);
     }
-    char resultJson[sizeof(g_result_json)];
+    static char resultJson[ResultJsonSize];
     if (readText(RESULT_JSON_PATH, resultJson, sizeof(resultJson))) {
         if (strcmp(resultJson, g_result_json) != 0 || g_word_count == 0) {
             copyText(g_result_json, sizeof(g_result_json), resultJson);
@@ -594,8 +598,43 @@ void formatHudOpacity(char *out, size_t outSize) {
     snprintf(out, outSize, "%d%%", percent);
 }
 
+void writeInputState() {
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), "{\"passthrough\":%s,\"ignore_keys\":%s}\n",
+             g_passthrough ? "true" : "false",
+             g_ignore_keys_in_passthrough ? "true" : "false");
+    writeTextFile(INPUT_STATE_PATH, buffer);
+}
+
+// Global toggles that apply across every game. Stored separately so a missing
+// or not-yet-resolved title id never resets them.
+void loadGlobalSettings() {
+    char buffer[128];
+    if (!readText(SETTINGS_PATH, buffer, sizeof(buffer))) {
+        g_ignore_keys_in_passthrough = true;
+        return;
+    }
+    const char *end = buffer + strlen(buffer);
+    bool ignoreKeys = true;
+    if (parseJsonBoolField(buffer, end, "ignore_keys_in_passthrough", ignoreKeys)) {
+        g_ignore_keys_in_passthrough = ignoreKeys;
+    }
+}
+
+void saveGlobalSettings() {
+    char buffer[96];
+    snprintf(buffer, sizeof(buffer), "{\"ignore_keys_in_passthrough\":%s}\n",
+             g_ignore_keys_in_passthrough ? "true" : "false");
+    writeTextFile(SETTINGS_PATH, buffer);
+}
+
 void loadGameSettings() {
+    if (g_program_id == 0) {
+        return;
+    }
+
     g_passthrough = true;
+    g_ocr_after_focus = false;
     g_position_top = false;
     g_hud_opacity = 11;
 
@@ -611,6 +650,10 @@ void loadGameSettings() {
     if (parseJsonBoolField(buffer, end, "passthrough", passthrough)) {
         g_passthrough = passthrough;
     }
+    bool ocrAfterFocus = false;
+    if (parseJsonBoolField(buffer, end, "ocr_after_focus", ocrAfterFocus)) {
+        g_ocr_after_focus = ocrAfterFocus;
+    }
     char position[16];
     if (parseJsonField(buffer, end, "position", position, sizeof(position))) {
         g_position_top = strcmp(position, "top") == 0;
@@ -622,20 +665,47 @@ void loadGameSettings() {
 }
 
 void saveGameSettings() {
-    mkdir(GAMES_DIR, 0777);
-    char path[128];
-    gameSettingsPath(path, sizeof(path));
-    char buffer[160];
-    snprintf(buffer, sizeof(buffer), "{\"passthrough\":%s,\"position\":\"%s\",\"opacity\":%d}\n",
-             g_passthrough ? "true" : "false", g_position_top ? "top" : "bottom", g_hud_opacity);
-    writeTextFile(path, buffer);
+    if (g_program_id != 0) {
+        mkdir(GAMES_DIR, 0777);
+        char path[128];
+        gameSettingsPath(path, sizeof(path));
+        char buffer[192];
+        snprintf(buffer, sizeof(buffer), "{\"passthrough\":%s,\"position\":\"%s\",\"opacity\":%d,\"ocr_after_focus\":%s}\n",
+                 g_passthrough ? "true" : "false",
+                 g_position_top ? "top" : "bottom",
+                 g_hud_opacity,
+                 g_ocr_after_focus ? "true" : "false");
+        writeTextFile(path, buffer);
+    }
+    writeInputState();
+}
+
+void requestOcrFromOverlay(const char *reason) {
+    char request[64];
+    snprintf(request, sizeof(request), "%s:%" PRIu64, reason, static_cast<u64>(svcGetSystemTick()));
+    writeTextFile(REQUEST_PATH, request);
+}
+
+void setPassthrough(bool state) {
+    const bool wasPassthrough = g_passthrough;
+    g_passthrough = state;
+    tsl::cfg::passthroughMode = g_passthrough;
+    saveGameSettings();
+    if (wasPassthrough && !g_passthrough && g_ocr_after_focus) {
+        requestOcrFromOverlay("focus");
+    }
 }
 
 void loadSettings() {
-    g_program_id = tsl::hlp::getForegroundProgramId();
+    const u64 currentProgram = tsl::hlp::getForegroundProgramId();
+    if (currentProgram != 0) {
+        g_program_id = currentProgram;
+    }
     loadKeyBindings();
+    loadGlobalSettings();
     loadGameSettings();
     tsl::cfg::passthroughMode = g_passthrough;
+    writeInputState();
 }
 
 } // namespace
@@ -648,10 +718,34 @@ public:
 
         auto *passToggle = new tsl::elm::ToggleListItem("Pass-through (live HUD)", g_passthrough, "On", "Off");
         passToggle->setStateChangedListener([](bool state) {
-            g_passthrough = state;
-            saveGameSettings();
+            setPassthrough(state);
         });
         list->addItem(passToggle);
+
+        auto *ignoreKeysToggle = new tsl::elm::ToggleListItem(
+            "Ignore OCR keys in pass-through (global)",
+            g_ignore_keys_in_passthrough,
+            "On",
+            "Off"
+        );
+        ignoreKeysToggle->setStateChangedListener([](bool state) {
+            g_ignore_keys_in_passthrough = state;
+            saveGlobalSettings();
+            writeInputState();
+        });
+        list->addItem(ignoreKeysToggle);
+
+        auto *ocrAfterFocusToggle = new tsl::elm::ToggleListItem(
+            "OCR after focusing HUD",
+            g_ocr_after_focus,
+            "On",
+            "Off"
+        );
+        ocrAfterFocusToggle->setStateChangedListener([](bool state) {
+            g_ocr_after_focus = state;
+            saveGameSettings();
+        });
+        list->addItem(ocrAfterFocusToggle);
 
         auto *positionToggle = new tsl::elm::ToggleListItem("HUD position", g_position_top, "Top", "Bottom");
         positionToggle->setStateChangedListener([](bool state) {
@@ -797,9 +891,13 @@ public:
 
     void update() override {
         tsl::cfg::passthroughMode = g_passthrough;
+        if (++m_input_state_tick >= 60) {
+            writeInputState();
+            m_input_state_tick = 0;
+        }
         if (++m_refresh_tick >= 15) {
             const u64 currentProgram = tsl::hlp::getForegroundProgramId();
-            if (currentProgram != g_program_id) {
+            if (currentProgram != 0 && currentProgram != g_program_id) {
                 g_program_id = currentProgram;
                 loadGameSettings();
             }
@@ -818,9 +916,7 @@ public:
         }
         const u64 passthroughMask = g_bindings.mask[switchocr::Action_Passthrough];
         if (passthroughMask != 0 && (keysHeld & passthroughMask) == passthroughMask && (keysDown & passthroughMask) != 0) {
-            g_passthrough = !g_passthrough;
-            tsl::cfg::passthroughMode = g_passthrough;
-            saveGameSettings();
+            setPassthrough(!g_passthrough);
             return true;
         }
         return false;
@@ -841,6 +937,13 @@ public:
             drawParagraph(renderer, panel_x + 16, panel_y + 33, panel_w - 32);
             drawTargetRow(renderer, panel_x + 16, panel_y + 59, panel_w - 32);
             drawStatusToggles(renderer, panel_x, panel_y, panel_w);
+            renderer->drawRect(
+                panel_x,
+                panel_y + panel_h - 2,
+                panel_w,
+                2,
+                !g_passthrough ? tsl::Color(0, 15, 4, 15) : tsl::Color(15, 2, 2, 15)
+            );
         }
 
         void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
@@ -950,14 +1053,34 @@ public:
         }
 
         void drawStatusToggles(tsl::gfx::Renderer *renderer, s32 panelX, s32 panelY, s32 panelW) {
-            char text[24];
-            snprintf(text, sizeof(text), "%s  %s",
-                     g_passthrough ? "HUD" : "FOCUS",
-                     g_position_top ? "TOP" : "BOT");
+            const char *modeText = g_passthrough ? "HUD" : "FOCUS";
+            const char *positionText = g_position_top ? "TOP" : "BOT";
             constexpr float size = 11.0F;
-            const s32 width = measureText(renderer, text, size);
-            const s32 x = panelX + panelW - width - 10;
-            drawText(renderer, text, x, panelY + 4, size, tsl::Color(11, 11, 11, 15), width + 8, false);
+            const s32 gap = 10;
+            const s32 modeWidth = measureText(renderer, modeText, size);
+            const s32 positionWidth = measureText(renderer, positionText, size);
+            const s32 x = panelX + panelW - modeWidth - positionWidth - gap - 12;
+            const s32 y = panelY + 12;
+            drawText(
+                renderer,
+                modeText,
+                x,
+                y,
+                size,
+                !g_passthrough ? tsl::Color(0, 15, 4, 15) : tsl::Color(15, 2, 2, 15),
+                modeWidth + 4,
+                false
+            );
+            drawText(
+                renderer,
+                positionText,
+                x + modeWidth + gap,
+                y,
+                size,
+                g_position_top ? tsl::Color(0, 15, 4, 15) : tsl::Color(15, 2, 2, 15),
+                positionWidth + 4,
+                false
+            );
         }
 
         void drawPlainParagraph(tsl::gfx::Renderer *renderer, const char *text, s32 x, s32 y, s32 maxWidth) {
@@ -1326,6 +1449,7 @@ private:
     }
 
     u8 m_refresh_tick = 0;
+    u8 m_input_state_tick = 0;
     u64 m_loading_started_tick = 0;
     u32 m_loading_generation = 0;
 };

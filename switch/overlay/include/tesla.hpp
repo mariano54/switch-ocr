@@ -3129,6 +3129,16 @@ namespace tsl {
             static elm::TouchEvent touchEvent;
             static u32 repeatTick = 0;
 
+            // Live-HUD pass-through: the game owns every button. Forward input to
+            // the active GUI so its own overlay combos still work, but never let
+            // the framework close (X/Plus), go back (B) or move focus.
+            if (tsl::cfg::passthroughMode) {
+                auto& passthroughGui = this->getCurrentGui();
+                if (passthroughGui != nullptr)
+                    passthroughGui->handleInput(keysDown, keysHeld, touchPos, joyStickPosLeft, joyStickPosRight);
+                return;
+            }
+
             if (keysDown & (HidNpadButton_X | HidNpadButton_Plus)) {
                 this->close();
                 return;

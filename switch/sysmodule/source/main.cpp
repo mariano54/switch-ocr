@@ -39,6 +39,7 @@
 #define TARGET_PATH CONFIG_DIR "/target.txt"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define HUD_PATH CONFIG_DIR "/hud.json"
+#define INPUT_STATE_PATH CONFIG_DIR "/input-state.json"
 #define DEBUG_PATH CONFIG_DIR "/debug.txt"
 #define REMOTE_CONFIG_PATH CONFIG_DIR "/remote.json"
 #define KEYS_PATH CONFIG_DIR "/keys.json"
@@ -174,6 +175,10 @@ bool g_fs_initialized = false;
 bool g_sd_mounted = false;
 switchocr::KeyBindings g_keys = switchocr::defaultBindings();
 time_t g_keys_mtime = 0;
+time_t g_input_state_mtime = 0;
+u32 g_input_state_poll_frame = 0;
+bool g_passthrough_active = false;
+bool g_ignore_keys_in_passthrough = false;
 bool g_hid_initialized = false;
 bool g_hidsys_initialized = false;
 bool g_capture_button_initialized = false;
@@ -1048,6 +1053,40 @@ bool parse_json_bool_field(const char *json, const char *key, bool &out) {
         return true;
     }
     return false;
+}
+
+void poll_input_state() {
+    if (!g_sd_mounted) {
+        return;
+    }
+    if (++g_input_state_poll_frame < 5) {
+        return;
+    }
+    g_input_state_poll_frame = 0;
+
+    struct stat info;
+    if (stat(INPUT_STATE_PATH, &info) != 0) {
+        g_passthrough_active = false;
+        g_ignore_keys_in_passthrough = false;
+        g_input_state_mtime = 0;
+        return;
+    }
+
+    g_input_state_mtime = info.st_mtime;
+
+    char json[160];
+    if (!read_text(INPUT_STATE_PATH, json, sizeof(json))) {
+        return;
+    }
+
+    bool passthrough = false;
+    bool ignore_keys = false;
+    if (parse_json_bool_field(json, "passthrough", passthrough)) {
+        g_passthrough_active = passthrough;
+    }
+    if (parse_json_bool_field(json, "ignore_keys", ignore_keys)) {
+        g_ignore_keys_in_passthrough = ignore_keys;
+    }
 }
 
 bool response_reports_failure(const char *json) {
@@ -3126,16 +3165,21 @@ void handle_input(u64 keys_down, u64 keys_held) {
     const u64 interesting_buttons = ocr_mask | mine_mask | left_mask | right_mask;
     const u64 current_held = keys_held & interesting_buttons;
 
+    if (g_passthrough_active && g_ignore_keys_in_passthrough) {
+        previous_held = current_held;
+        return;
+    }
+
     // A binding is "pressed" when its full mask becomes held this frame.
     auto pressed = [&](u64 mask) -> bool {
         return mask != 0 && (keys_held & mask) == mask && (previous_held & mask) != mask;
     };
 
-    const bool ocr_key_pressed = pressed(ocr_mask) || (keys_down & ocr_mask) != 0;
+    const bool ocr_key_pressed = pressed(ocr_mask);
     const bool capture_pressed = capture_button_pressed();
-    const bool mine_pressed = pressed(mine_mask) || (keys_down & mine_mask) != 0;
-    const bool left_pressed = pressed(left_mask) || (keys_down & left_mask) != 0;
-    const bool right_pressed = pressed(right_mask) || (keys_down & right_mask) != 0;
+    const bool mine_pressed = pressed(mine_mask);
+    const bool left_pressed = pressed(left_mask);
+    const bool right_pressed = pressed(right_mask);
     const bool ocr_pending = g_ocr_pending.load(std::memory_order_acquire);
 
     if (ocr_cooldown > 0) {
@@ -3247,6 +3291,7 @@ int main(int argc, char **argv) {
 
         poll_request_file();
         poll_keys();
+        poll_input_state();
         poll_ocr_timeout();
 
         if (pad_ready) {
