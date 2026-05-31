@@ -59,9 +59,11 @@ int g_selected_word = -1;
 int g_saved_word_total = 0;
 int g_lookup_count = 0;
 u32 g_spinner_frame = 0;
+u32 g_hud_generation = 0;
 bool g_hud_pending = false;
 bool g_hud_saved = false;
 bool g_hud_saving = false;
+bool g_ocr_visual_timed_out = false;
 bool g_sd_mounted = false;
 
 u64 g_program_id = 0;
@@ -479,6 +481,10 @@ void parseHudJson(const char *json) {
         hasSelected = true;
         g_selected_word = (selected >= 0 && selected < static_cast<int>(g_word_count)) ? selected : -1;
     }
+    int generation = 0;
+    if (parseJsonIntField(json, end, "generation", generation) && generation >= 0) {
+        g_hud_generation = static_cast<u32>(generation);
+    }
     g_hud_frequency[0] = '\0';
     g_hud_kanji[0] = '\0';
     g_hud_mining_status[0] = '\0';
@@ -726,6 +732,7 @@ public:
                 loadGameSettings();
             }
             refreshDisplayFiles();
+            updateOcrWatchdog();
             m_refresh_tick = 0;
         }
     }
@@ -886,7 +893,7 @@ public:
         }
 
         bool ocrLoading() const {
-            return strncmp(g_target, "Loading", 7) == 0 || g_hud_pending;
+            return !g_ocr_visual_timed_out && (strncmp(g_target, "Loading", 7) == 0 || g_hud_pending);
         }
 
         bool savingWord() const {
@@ -1176,7 +1183,35 @@ public:
     };
 
 private:
+    static constexpr u64 OcrVisualTimeoutNs = 25000000000ULL;
+
+    void updateOcrWatchdog() {
+        const bool loading = strncmp(g_target, "Loading", 7) == 0 || g_hud_pending;
+        if (!loading) {
+            m_loading_started_tick = 0;
+            m_loading_generation = g_hud_generation;
+            g_ocr_visual_timed_out = false;
+            return;
+        }
+
+        if (m_loading_started_tick == 0 || m_loading_generation != g_hud_generation) {
+            m_loading_started_tick = svcGetSystemTick();
+            m_loading_generation = g_hud_generation;
+            g_ocr_visual_timed_out = false;
+            return;
+        }
+
+        if (armTicksToNs(svcGetSystemTick() - m_loading_started_tick) >= OcrVisualTimeoutNs) {
+            g_ocr_visual_timed_out = true;
+            g_hud_pending = false;
+            copyText(g_result, sizeof(g_result), "OCR timed out. Press OCR again.");
+            copyText(g_target, sizeof(g_target), "OCR timed out. Press OCR again.");
+        }
+    }
+
     u8 m_refresh_tick = 0;
+    u64 m_loading_started_tick = 0;
+    u32 m_loading_generation = 0;
 };
 
 class SwitchOcrOverlay final : public tsl::Overlay {

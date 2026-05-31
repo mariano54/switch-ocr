@@ -773,12 +773,13 @@ void write_hud_state() {
     copy_json_escaped(kanji, sizeof(kanji), word != nullptr ? word->kanji : "");
     copy_json_escaped(mining_status, sizeof(mining_status), g_mining_status);
 
-    char state[880];
+    char state[920];
     snprintf(
         state,
         sizeof(state),
-        "{\"selected\":%d,\"pending\":%s,\"saving\":%s,\"saving_count\":%u,\"f\":\"%s\",\"k\":\"%s\",\"saved\":%s,\"saved_count\":%d,\"lookup_count\":%d,\"m\":\"%s\"}",
+        "{\"selected\":%d,\"generation\":%u,\"pending\":%s,\"saving\":%s,\"saving_count\":%u,\"f\":\"%s\",\"k\":\"%s\",\"saved\":%s,\"saved_count\":%d,\"lookup_count\":%d,\"m\":\"%s\"}",
         g_selected_word,
+        g_ocr_generation.load(std::memory_order_acquire),
         g_ocr_pending.load(std::memory_order_acquire) ? "true" : "false",
         (word != nullptr && word->saving) ? "true" : "false",
         g_mining_saving_count.load(std::memory_order_acquire),

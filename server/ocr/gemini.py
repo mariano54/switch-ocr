@@ -22,24 +22,29 @@ JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 GEMINI_HOST = "generativelanguage.googleapis.com"
 
-# Opening a fresh TLS connection per request stalls on the handshake ~30% of the
-# time, so we keep a persistent keep-alive connection and reuse it (guarded by a
-# lock since the server is multithreaded). The connect/first-byte timeout only
-# needs to cover the rare case of (re)establishing the connection plus uploading
-# the image; once the stream is flowing the per-chunk read timeout is tightened.
-GEMINI_CONNECT_TIMEOUT_SECONDS = 5.0      # connect + image upload + first response
-GEMINI_STREAM_READ_TIMEOUT_SECONDS = 5.0  # max gap between streamed chunks
-GEMINI_TOTAL_DEADLINE_SECONDS = 18.0      # hard cap across all attempts
-GEMINI_MAX_ATTEMPTS = 4
+# A fresh TLS connection stalls on first-byte ~30% of the time, but a warm
+# reused connection is reliable (0 stalls). Reuse the connection while it is
+# fresh; after a long idle period, drop it before the next real OCR request so
+# we don't reuse a stale socket. This does not send background/ping requests.
+GEMINI_CONNECT_TIMEOUT_SECONDS = 5.0       # connect + image upload + first response
+GEMINI_STREAM_READ_TIMEOUT_SECONDS = 5.0   # max gap between streamed chunks
+GEMINI_TOTAL_DEADLINE_SECONDS = 18.0       # hard cap across all attempts
+GEMINI_MAX_ATTEMPTS = 5
+GEMINI_IDLE_EXPIRY_SECONDS = 30.0          # reconnect rather than reuse if idle longer
 GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 _conn_lock = threading.Lock()
 _conn: http.client.HTTPSConnection | None = None
+_conn_last_used = 0.0
 _ssl_ctx = ssl.create_default_context()
 
 
 def _get_connection() -> http.client.HTTPSConnection:
+    """Returns a usable connection, reconnecting if the current one has been idle
+    long enough that it is likely stale. Must be called while holding _conn_lock."""
     global _conn
+    if _conn is not None and (time.time() - _conn_last_used) > GEMINI_IDLE_EXPIRY_SECONDS:
+        _drop_connection()
     if _conn is None:
         _conn = http.client.HTTPSConnection(
             GEMINI_HOST, timeout=GEMINI_CONNECT_TIMEOUT_SECONDS, context=_ssl_ctx
@@ -48,6 +53,7 @@ def _get_connection() -> http.client.HTTPSConnection:
 
 
 def _drop_connection() -> None:
+    """Closes the shared connection. Must be called while holding _conn_lock."""
     global _conn
     if _conn is not None:
         try:
@@ -179,6 +185,7 @@ class GeminiOcrProvider:
         GEMINI_TOTAL_DEADLINE_SECONDS; once streaming, the per-chunk read timeout
         bounds a silent stream.
         """
+        global _conn_last_used
         headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
         deadline = time.time() + GEMINI_TOTAL_DEADLINE_SECONDS
         last_error = "Gemini request failed"
@@ -225,6 +232,7 @@ class GeminiOcrProvider:
 
                     text = "".join(chunks)
                     if text:
+                        _conn_last_used = time.time()
                         _log(f"[GeminiOCR] stream ok in {time.time() - started:.2f}s (attempt {attempt})")
                         return text, None
                     last_error = "Gemini returned no streamed text"
