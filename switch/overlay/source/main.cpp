@@ -69,6 +69,7 @@ bool g_sd_mounted = false;
 u64 g_program_id = 0;
 bool g_passthrough = true;
 bool g_position_top = false;
+int g_hud_opacity = 11;
 switchocr::KeyBindings g_bindings = switchocr::defaultBindings();
 
 void copyText(char *out, size_t outSize, const char *text) {
@@ -573,9 +574,26 @@ void saveKeyBindings() {
     writeTextFile(KEYS_PATH, buffer);
 }
 
+int clampHudOpacity(int opacity) {
+    if (opacity < 1) {
+        return 1;
+    }
+    if (opacity > 15) {
+        return 15;
+    }
+    return opacity;
+}
+
+void formatHudOpacity(char *out, size_t outSize) {
+    const int opacity = clampHudOpacity(g_hud_opacity);
+    const int percent = (opacity * 100 + 7) / 15;
+    snprintf(out, outSize, "%d%%", percent);
+}
+
 void loadGameSettings() {
     g_passthrough = true;
     g_position_top = false;
+    g_hud_opacity = 11;
 
     char path[128];
     gameSettingsPath(path, sizeof(path));
@@ -593,6 +611,10 @@ void loadGameSettings() {
     if (parseJsonField(buffer, end, "position", position, sizeof(position))) {
         g_position_top = strcmp(position, "top") == 0;
     }
+    int opacity = g_hud_opacity;
+    if (parseJsonIntField(buffer, end, "opacity", opacity)) {
+        g_hud_opacity = clampHudOpacity(opacity);
+    }
 }
 
 void saveGameSettings() {
@@ -600,8 +622,8 @@ void saveGameSettings() {
     char path[128];
     gameSettingsPath(path, sizeof(path));
     char buffer[160];
-    snprintf(buffer, sizeof(buffer), "{\"passthrough\":%s,\"position\":\"%s\"}\n",
-             g_passthrough ? "true" : "false", g_position_top ? "top" : "bottom");
+    snprintf(buffer, sizeof(buffer), "{\"passthrough\":%s,\"position\":\"%s\",\"opacity\":%d}\n",
+             g_passthrough ? "true" : "false", g_position_top ? "top" : "bottom", g_hud_opacity);
     writeTextFile(path, buffer);
 }
 
@@ -633,6 +655,27 @@ public:
             saveGameSettings();
         });
         list->addItem(positionToggle);
+
+        char opacityValue[16];
+        formatHudOpacity(opacityValue, sizeof(opacityValue));
+        auto *opacityItem = new tsl::elm::ListItem("HUD background opacity");
+        opacityItem->setValue(opacityValue);
+        opacityItem->setClickListener([opacityItem](u64 keys) {
+            if (!(keys & HidNpadButton_A)) {
+                return false;
+            }
+            g_hud_opacity += 1;
+            if (g_hud_opacity > 15) {
+                g_hud_opacity = 1;
+            }
+            saveGameSettings();
+
+            char value[16];
+            formatHudOpacity(value, sizeof(value));
+            opacityItem->setValue(value);
+            return true;
+        });
+        list->addItem(opacityItem);
 
         list->addItem(new tsl::elm::CategoryHeader("Key bindings (global)"));
 
@@ -755,12 +798,12 @@ public:
 
             constexpr s32 panel_x = 0;
             constexpr s32 panel_w = 1280;
-            constexpr s32 panel_h = 108;
+            constexpr s32 panel_h = 85;
             const s32 panel_y = g_position_top ? 0 : 720 - panel_h;
-            renderer->drawRect(panel_x, panel_y, panel_w, panel_h, tsl::Color(0, 0, 0, 11));
+            renderer->drawRect(panel_x, panel_y, panel_w, panel_h, tsl::Color(0, 0, 0, static_cast<u8>(g_hud_opacity)));
 
-            drawParagraph(renderer, panel_x + 16, panel_y + 34, panel_w - 32);
-            drawTargetRow(renderer, panel_x + 16, panel_y + 82, panel_w - 32);
+            drawParagraph(renderer, panel_x + 16, panel_y + 33, panel_w - 32);
+            drawTargetRow(renderer, panel_x + 16, panel_y + 59, panel_w - 32);
             drawStatusToggles(renderer, panel_x, panel_y, panel_w);
         }
 
@@ -774,8 +817,9 @@ public:
 
     private:
         static constexpr float ParagraphFontSize = 18.0F;
-        static constexpr float FuriganaFontSize = 10.0F;
-        static constexpr s32 ParagraphLineHeight = 25;
+        static constexpr float FuriganaFontSize = 14.0F;
+        static constexpr s32 FuriganaMinGap = 4;
+        static constexpr s32 ParagraphLineHeight = 22;
         static constexpr s32 HighlightHeight = 22;
         static constexpr s32 HighlightYOffset = 18;
 
@@ -877,7 +921,7 @@ public:
             constexpr float size = 11.0F;
             const s32 width = measureText(renderer, text, size);
             const s32 x = panelX + panelW - width - 10;
-            drawText(renderer, text, x, panelY + 12, size, tsl::Color(11, 11, 11, 15), width + 8, false);
+            drawText(renderer, text, x, panelY + 4, size, tsl::Color(11, 11, 11, 15), width + 8, false);
         }
 
         void drawPlainParagraph(tsl::gfx::Renderer *renderer, const char *text, s32 x, s32 y, s32 maxWidth) {
@@ -915,6 +959,7 @@ public:
 
             s32 cursorX = x;
             s32 cursorY = y;
+            s32 previousFuriganaRight = x;
             int line = 0;
             for (size_t i = 0; i < g_word_count; i++) {
                 const OcrWord &word = g_words[i];
@@ -924,29 +969,48 @@ public:
                 }
 
                 const s32 wordWidth = measureText(renderer, surface, ParagraphFontSize);
-                if (cursorX > x && cursorX + wordWidth > x + maxWidth) {
+                const bool hasFurigana = word.reading[0] != '\0' && strcmp(word.reading, surface) != 0;
+                const s32 readingWidth = hasFurigana ? measureText(renderer, word.reading, FuriganaFontSize) : 0;
+                if (hasFurigana && cursorX > x) {
+                    const s32 readingLeft = cursorX + ((wordWidth - readingWidth) / 2);
+                    const s32 extraGap = previousFuriganaRight + FuriganaMinGap - readingLeft;
+                    if (extraGap > 0) {
+                        cursorX += extraGap;
+                    }
+                }
+
+                s32 visualRight = cursorX + wordWidth;
+                if (hasFurigana) {
+                    const s32 readingRight = cursorX + ((wordWidth - readingWidth) / 2) + readingWidth;
+                    if (readingRight > visualRight) {
+                        visualRight = readingRight;
+                    }
+                }
+                if (cursorX > x && visualRight > x + maxWidth) {
                     line++;
                     if (line >= 2) {
                         break;
                     }
                     cursorX = x;
                     cursorY = y + ParagraphLineHeight;
+                    previousFuriganaRight = x;
                 }
 
                 const bool selected = static_cast<int>(i) == g_selected_word;
-                if (word.reading[0] != '\0' && strcmp(word.reading, surface) != 0) {
-                    const s32 readingWidth = measureText(renderer, word.reading, FuriganaFontSize);
+                if (hasFurigana) {
                     const s32 readingX = cursorX + ((wordWidth - readingWidth) / 2);
+                    const s32 actualReadingX = readingX > x ? readingX : cursorX;
                     drawText(
                         renderer,
                         word.reading,
-                        readingX > x ? readingX : cursorX,
-                        cursorY - 16,
+                        actualReadingX,
+                        cursorY - 17,
                         FuriganaFontSize,
                         selected ? tsl::Color(11, 15, 12, 15) : tsl::Color(10, 12, 10, 15),
                         maxWidth - (cursorX - x),
                         false
                     );
+                    previousFuriganaRight = actualReadingX + readingWidth;
                 }
                 if (selected && wordWidth > 0) {
                     renderer->drawRect(cursorX - 2, cursorY - HighlightYOffset, wordWidth + 4, HighlightHeight, tsl::Color(0, 15, 13, 7));
