@@ -569,9 +569,13 @@ void loadKeyBindings() {
 }
 
 void saveKeyBindings() {
-    char buffer[160];
+    char buffer[256];
     switchocr::serializeBindings(g_bindings, buffer, sizeof(buffer));
     writeTextFile(KEYS_PATH, buffer);
+}
+
+void formatMenuBindingValue(int action, char *out, size_t outSize) {
+    switchocr::formatMaskName(g_bindings.mask[action], out, outSize);
 }
 
 int clampHudOpacity(int opacity) {
@@ -681,7 +685,9 @@ public:
 
         for (int action = 0; action < switchocr::Action_Count; action++) {
             auto *item = new tsl::elm::ListItem(switchocr::kActions[action].label);
-            item->setValue(switchocr::nameForMask(g_bindings.mask[action]));
+            char value[32];
+            formatMenuBindingValue(action, value, sizeof(value));
+            item->setValue(value);
             m_remapItems[action] = item;
             item->setClickListener([this, action](u64 keys) {
                 // Only start capture when not already capturing, otherwise the A
@@ -689,7 +695,8 @@ public:
                 if ((keys & HidNpadButton_A) && m_capturing < 0) {
                     m_capturing = action;
                     m_captureArmed = false;
-                    m_remapItems[action]->setValue("Press button...");
+                    m_captureMask = 0;
+                    m_remapItems[action]->setValue("Hold combo...");
                     return true;
                 }
                 return false;
@@ -704,7 +711,9 @@ public:
                 saveKeyBindings();
                 for (int action = 0; action < switchocr::Action_Count; action++) {
                     if (m_remapItems[action] != nullptr) {
-                        m_remapItems[action]->setValue(switchocr::nameForMask(g_bindings.mask[action]));
+                        char value[32];
+                        formatMenuBindingValue(action, value, sizeof(value));
+                        m_remapItems[action]->setValue(value);
                     }
                 }
                 return true;
@@ -733,19 +742,38 @@ public:
             }
             return true;
         }
-        if (keysDown & HidNpadButton_B) {
-            m_remapItems[m_capturing]->setValue(switchocr::nameForMask(g_bindings.mask[m_capturing]));
+        u64 heldMask = 0;
+        for (size_t i = 0; i < switchocr::kButtonCount; i++) {
+            if ((keysHeld & switchocr::kButtons[i].mask) == switchocr::kButtons[i].mask) {
+                heldMask |= switchocr::kButtons[i].mask;
+            }
+        }
+
+        if (heldMask != 0) {
+            m_captureMask = heldMask;
+            char value[32];
+            switchocr::formatMaskName(m_captureMask, value, sizeof(value));
+            m_remapItems[m_capturing]->setValue(value);
+            return true;
+        }
+
+        if (m_captureMask != 0) {
+            g_bindings.mask[m_capturing] = m_captureMask;
+            saveKeyBindings();
+            char value[32];
+            formatMenuBindingValue(m_capturing, value, sizeof(value));
+            m_remapItems[m_capturing]->setValue(value);
+            m_captureMask = 0;
             m_capturing = -1;
             return true;
         }
-        for (size_t i = 0; i < switchocr::kButtonCount; i++) {
-            if (keysDown & switchocr::kButtons[i].mask) {
-                g_bindings.mask[m_capturing] = switchocr::kButtons[i].mask;
-                saveKeyBindings();
-                m_remapItems[m_capturing]->setValue(switchocr::kButtons[i].name);
-                m_capturing = -1;
-                return true;
-            }
+
+        if (keysDown & HidNpadButton_B) {
+            char value[32];
+            formatMenuBindingValue(m_capturing, value, sizeof(value));
+            m_remapItems[m_capturing]->setValue(value);
+            m_capturing = -1;
+            return true;
         }
         return true;
     }
@@ -753,6 +781,7 @@ public:
 private:
     tsl::elm::ListItem *m_remapItems[switchocr::Action_Count] = {};
     int m_capturing = -1;
+    u64 m_captureMask = 0;
     bool m_captureArmed = false;
 };
 
@@ -761,7 +790,7 @@ public:
     tsl::elm::Element *createUI() override {
         loadSettings();
         switchocr::formatHelpResult(g_bindings, g_result, sizeof(g_result));
-        switchocr::formatHelpTarget(g_target, sizeof(g_target));
+        switchocr::formatHelpTarget(g_bindings, g_target, sizeof(g_target));
         refreshDisplayFiles();
         return new HudElement();
     }
@@ -780,11 +809,18 @@ public:
         }
     }
 
-    // Hold ZL+ZR and press Up to open the settings/remap menu.
+    // Toggle HUD pass-through with the fully configurable binding.
     bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &, HidAnalogStickState, HidAnalogStickState) override {
         constexpr u64 modifier = HidNpadButton_ZL | HidNpadButton_ZR;
         if ((keysHeld & modifier) == modifier && (keysDown & HidNpadButton_Up)) {
             tsl::changeTo<SettingsGui>();
+            return true;
+        }
+        const u64 passthroughMask = g_bindings.mask[switchocr::Action_Passthrough];
+        if (passthroughMask != 0 && (keysHeld & passthroughMask) == passthroughMask && (keysDown & passthroughMask) != 0) {
+            g_passthrough = !g_passthrough;
+            tsl::cfg::passthroughMode = g_passthrough;
+            saveGameSettings();
             return true;
         }
         return false;

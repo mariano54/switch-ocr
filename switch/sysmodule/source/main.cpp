@@ -360,7 +360,7 @@ void poll_keys() {
 
     struct stat info;
     if (stat(KEYS_PATH, &info) != 0) {
-        char buffer[160];
+        char buffer[256];
         switchocr::serializeBindings(g_keys, buffer, sizeof(buffer));
         write_text(KEYS_PATH, buffer);
         if (stat(KEYS_PATH, &info) != 0) {
@@ -816,7 +816,7 @@ void reset_startup_hud_state() {
     char result[SentenceSize];
     char target[640];
     switchocr::formatHelpResult(g_keys, result, sizeof(result));
-    switchocr::formatHelpTarget(target, sizeof(target));
+    switchocr::formatHelpTarget(g_keys, target, sizeof(target));
     copy_text(g_sentence, sizeof(g_sentence), result);
     set_status(StartupStatusText);
     write_text(STATUS_PATH, g_status);
