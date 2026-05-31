@@ -89,6 +89,7 @@ namespace tsl {
         extern u16 FramebufferWidth;            ///< Width of the framebuffer
         extern u16 FramebufferHeight;           ///< Height of the framebuffer
         extern u64 launchCombo;                 ///< Overlay activation key combo
+        extern bool passthroughMode;            ///< When true the game keeps receiving input (live HUD); when false the overlay grabs focus (game pauses). Applied live each loop.
 
     }
 
@@ -292,6 +293,21 @@ namespace tsl {
             hidsysEnableAppletToGetInput(!enabled, applicationAruid);
 
             hidsysEnableAppletToGetInput(true, 0);
+        }
+
+        /**
+         * @brief Returns the program (title) id of the currently running foreground application, or 0 if none.
+         */
+        static u64 getForegroundProgramId() {
+            u64 pid = 0;
+            if (R_FAILED(pmdmntGetApplicationProcessId(&pid)) || pid == 0) {
+                return 0;
+            }
+            u64 programId = 0;
+            if (R_FAILED(pminfoGetProgramId(&programId, pid))) {
+                return 0;
+            }
+            return programId;
         }
 
         /**
@@ -3568,12 +3584,10 @@ namespace tsl {
             eventClear(&shData.comboEvent);
             shData.overlayOpen = true;
 
-
-#ifdef TESLA_PASS_THROUGH_INPUT
-            hlp::hidsysEnableAppletToGetInput(true, 0);
-#else
-            hlp::requestForeground(true);
-#endif
+            // Apply the current pass-through mode. requestForeground(false) leaves the game
+            // receiving input (live HUD); requestForeground(true) grabs focus (game pauses).
+            bool appliedPassthrough = tsl::cfg::passthroughMode;
+            hlp::requestForeground(!appliedPassthrough);
 
             overlay->show();
             overlay->clearScreen();
@@ -3581,6 +3595,12 @@ namespace tsl {
 
             while (shData.running) {
                 overlay->loop();
+
+                // Live-switch focus when the active Gui flips pass-through mode.
+                if (tsl::cfg::passthroughMode != appliedPassthrough) {
+                    appliedPassthrough = tsl::cfg::passthroughMode;
+                    hlp::requestForeground(!appliedPassthrough);
+                }
 
                 {
                     std::scoped_lock lock(shData.dataMutex);
@@ -3600,9 +3620,8 @@ namespace tsl {
             overlay->clearScreen();
             overlay->resetFlags();
 
-#ifndef TESLA_PASS_THROUGH_INPUT
+            // Always hand input back to the game when the overlay closes.
             hlp::requestForeground(false);
-#endif
 
             shData.overlayOpen = false;
             eventClear(&shData.comboEvent);
@@ -3635,6 +3654,7 @@ namespace tsl::cfg {
     u16 FramebufferWidth  = 0;
     u16 FramebufferHeight = 0;
     u64 launchCombo = HidNpadButton_L | HidNpadButton_Down | HidNpadButton_StickR;
+    bool passthroughMode = true;
 }
 
 extern "C" {
@@ -3658,6 +3678,7 @@ extern "C" {
                 ASSERT_FATAL(plInitialize(PlServiceType_System));   // Use pl:s for 15.0.1 and below to prevent qlaunch/overlaydisp session exhaustion
             }
             ASSERT_FATAL(pmdmntInitialize());                       // PID querying
+            ASSERT_FATAL(pminfoInitialize());                       // Program (title) id querying
             ASSERT_FATAL(hidsysInitialize());                       // Focus control
             ASSERT_FATAL(setsysInitialize());                       // Settings querying
         });
@@ -3671,6 +3692,7 @@ extern "C" {
         fsExit();
         hidExit();
         plExit();
+        pminfoExit();
         pmdmntExit();
         hidsysExit();
         setsysExit();

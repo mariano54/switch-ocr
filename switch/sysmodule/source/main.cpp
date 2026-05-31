@@ -22,6 +22,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "switchocr_keys.hpp"
+
 #ifndef SERVER_HOST
 #define SERVER_HOST "192.168.1.100"
 #endif
@@ -39,6 +41,7 @@
 #define HUD_PATH CONFIG_DIR "/hud.json"
 #define DEBUG_PATH CONFIG_DIR "/debug.txt"
 #define REMOTE_CONFIG_PATH CONFIG_DIR "/remote.json"
+#define KEYS_PATH CONFIG_DIR "/keys.json"
 
 extern "C" {
 extern char *fake_heap_start;
@@ -171,6 +174,8 @@ int g_lookup_count = 0;
 bool g_sm_initialized = false;
 bool g_fs_initialized = false;
 bool g_sd_mounted = false;
+switchocr::KeyBindings g_keys = switchocr::defaultBindings();
+time_t g_keys_mtime = 0;
 bool g_hid_initialized = false;
 bool g_hidsys_initialized = false;
 bool g_capture_button_initialized = false;
@@ -346,6 +351,34 @@ bool read_text(const char *path, char *out, size_t out_size) {
         out[--read] = '\0';
     }
     return read > 0;
+}
+
+// Reloads global key bindings when keys.json changes. Creates the file with
+// defaults if missing so the overlay menu has a baseline to edit.
+void poll_keys() {
+    if (!g_sd_mounted) {
+        return;
+    }
+
+    struct stat info;
+    if (stat(KEYS_PATH, &info) != 0) {
+        char buffer[160];
+        switchocr::serializeBindings(g_keys, buffer, sizeof(buffer));
+        write_text(KEYS_PATH, buffer);
+        if (stat(KEYS_PATH, &info) != 0) {
+            return;
+        }
+    }
+
+    if (info.st_mtime == g_keys_mtime) {
+        return;
+    }
+    g_keys_mtime = info.st_mtime;
+
+    char buffer[256];
+    if (read_text(KEYS_PATH, buffer, sizeof(buffer))) {
+        g_keys = switchocr::parseBindings(buffer);
+    }
 }
 
 bool ensure_services_ready(bool include_hud_services) {
@@ -3077,12 +3110,24 @@ void handle_input(u64 keys_down, u64 keys_held) {
     static u64 previous_held = 0;
     static u32 ocr_cooldown = 0;
     static u32 mine_cooldown = 0;
-    const u64 interesting_buttons =
-        HidNpadButton_Minus | HidNpadButton_StickR | HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_AnyLeft | HidNpadButton_AnyRight;
+
+    const u64 ocr_mask = g_keys.mask[switchocr::Action_Ocr];
+    const u64 mine_mask = g_keys.mask[switchocr::Action_Mine];
+    const u64 left_mask = g_keys.mask[switchocr::Action_Left];
+    const u64 right_mask = g_keys.mask[switchocr::Action_Right];
+    const u64 interesting_buttons = ocr_mask | mine_mask | left_mask | right_mask;
     const u64 current_held = keys_held & interesting_buttons;
-    const bool minus_pressed = ((keys_down | (current_held & ~previous_held)) & HidNpadButton_Minus) != 0;
+
+    // A binding is "pressed" when its full mask becomes held this frame.
+    auto pressed = [&](u64 mask) -> bool {
+        return mask != 0 && (keys_held & mask) == mask && (previous_held & mask) != mask;
+    };
+
+    const bool ocr_key_pressed = pressed(ocr_mask) || (keys_down & ocr_mask) != 0;
     const bool capture_pressed = capture_button_pressed();
-    const bool mine_pressed = ((keys_down | (current_held & ~previous_held)) & HidNpadButton_StickR) != 0;
+    const bool mine_pressed = pressed(mine_mask) || (keys_down & mine_mask) != 0;
+    const bool left_pressed = pressed(left_mask) || (keys_down & left_mask) != 0;
+    const bool right_pressed = pressed(right_mask) || (keys_down & right_mask) != 0;
     const bool ocr_pending = g_ocr_pending.load(std::memory_order_acquire);
 
     if (ocr_cooldown > 0) {
@@ -3092,15 +3137,15 @@ void handle_input(u64 keys_down, u64 keys_held) {
         mine_cooldown--;
     }
 
-    if ((minus_pressed || capture_pressed) && ocr_cooldown == 0) {
+    if ((ocr_key_pressed || capture_pressed) && ocr_cooldown == 0) {
         ocr_cooldown = OcrCooldownFrames;
-        queue_ocr_request(capture_pressed && !minus_pressed ? "Capture" : "Minus");
+        queue_ocr_request(capture_pressed && !ocr_key_pressed ? "Capture" : "Minus");
     } else if (!ocr_pending && mine_pressed && mine_cooldown == 0) {
         mine_cooldown = MineCooldownFrames;
         queue_mine_selected_word();
-    } else if (!ocr_pending && (keys_down & (HidNpadButton_Left | HidNpadButton_AnyLeft))) {
+    } else if (!ocr_pending && left_pressed) {
         move_selection(-1);
-    } else if (!ocr_pending && (keys_down & (HidNpadButton_Right | HidNpadButton_AnyRight))) {
+    } else if (!ocr_pending && right_pressed) {
         move_selection(1);
     }
 
@@ -3161,6 +3206,7 @@ int main(int argc, char **argv) {
 
     mkdir("sdmc:/config", 0777);
     mkdir(CONFIG_DIR, 0777);
+    poll_keys();
     baseline_startup_request_file();
     reset_startup_hud_state();
     start_ocr_worker();
@@ -3192,6 +3238,7 @@ int main(int argc, char **argv) {
         }
 
         poll_request_file();
+        poll_keys();
         poll_ocr_timeout();
 
         if (pad_ready) {

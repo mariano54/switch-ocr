@@ -1,12 +1,14 @@
 #define TESLA_INIT_IMPL
 #define TESLA_FULLSCREEN_HUD
-#define TESLA_PASS_THROUGH_INPUT
 #include <tesla.hpp>
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#include "switchocr_keys.hpp"
 
 #define CONFIG_DIR "sdmc:/config/switch-ocr"
 #define REQUEST_PATH CONFIG_DIR "/request.txt"
@@ -15,6 +17,8 @@
 #define TARGET_PATH CONFIG_DIR "/target.txt"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define HUD_PATH CONFIG_DIR "/hud.json"
+#define KEYS_PATH CONFIG_DIR "/keys.json"
+#define GAMES_DIR CONFIG_DIR "/games"
 
 namespace {
 
@@ -59,6 +63,11 @@ bool g_hud_pending = false;
 bool g_hud_saved = false;
 bool g_hud_saving = false;
 bool g_sd_mounted = false;
+
+u64 g_program_id = 0;
+bool g_passthrough = true;
+bool g_position_top = false;
+switchocr::KeyBindings g_bindings = switchocr::defaultBindings();
 
 void copyText(char *out, size_t outSize, const char *text) {
     if (outSize == 0) {
@@ -527,20 +536,188 @@ void refreshDisplayFiles() {
     }
 }
 
+void writeTextFile(const char *path, const char *text) {
+    if (!g_sd_mounted) {
+        return;
+    }
+    FILE *file = fopen(path, "w");
+    if (file == nullptr) {
+        return;
+    }
+    fputs(text, file);
+    fclose(file);
+}
+
+void gameSettingsPath(char *out, size_t outSize) {
+    snprintf(out, outSize, "%s/%016" PRIX64 ".json", GAMES_DIR, g_program_id);
+}
+
+void loadKeyBindings() {
+    char buffer[256];
+    if (readText(KEYS_PATH, buffer, sizeof(buffer))) {
+        g_bindings = switchocr::parseBindings(buffer);
+    } else {
+        g_bindings = switchocr::defaultBindings();
+    }
+}
+
+void saveKeyBindings() {
+    char buffer[160];
+    switchocr::serializeBindings(g_bindings, buffer, sizeof(buffer));
+    writeTextFile(KEYS_PATH, buffer);
+}
+
+void loadGameSettings() {
+    g_passthrough = true;
+    g_position_top = false;
+
+    char path[128];
+    gameSettingsPath(path, sizeof(path));
+    char buffer[160];
+    if (!readText(path, buffer, sizeof(buffer))) {
+        return;
+    }
+
+    const char *end = buffer + strlen(buffer);
+    bool passthrough = true;
+    if (parseJsonBoolField(buffer, end, "passthrough", passthrough)) {
+        g_passthrough = passthrough;
+    }
+    char position[16];
+    if (parseJsonField(buffer, end, "position", position, sizeof(position))) {
+        g_position_top = strcmp(position, "top") == 0;
+    }
+}
+
+void saveGameSettings() {
+    mkdir(GAMES_DIR, 0777);
+    char path[128];
+    gameSettingsPath(path, sizeof(path));
+    char buffer[160];
+    snprintf(buffer, sizeof(buffer), "{\"passthrough\":%s,\"position\":\"%s\"}\n",
+             g_passthrough ? "true" : "false", g_position_top ? "top" : "bottom");
+    writeTextFile(path, buffer);
+}
+
+void loadSettings() {
+    g_program_id = tsl::hlp::getForegroundProgramId();
+    loadKeyBindings();
+    loadGameSettings();
+    tsl::cfg::passthroughMode = g_passthrough;
+}
+
 } // namespace
+
+class SettingsGui final : public tsl::Gui {
+public:
+    tsl::elm::Element *createUI() override {
+        auto *frame = new tsl::elm::OverlayFrame("Switch OCR", "Settings");
+        auto *list = new tsl::elm::List();
+
+        auto *passToggle = new tsl::elm::ToggleListItem("Pass-through (live HUD)", g_passthrough, "On", "Off");
+        passToggle->setStateChangedListener([](bool state) {
+            g_passthrough = state;
+            saveGameSettings();
+        });
+        list->addItem(passToggle);
+
+        auto *positionToggle = new tsl::elm::ToggleListItem("HUD position", g_position_top, "Top", "Bottom");
+        positionToggle->setStateChangedListener([](bool state) {
+            g_position_top = state;
+            saveGameSettings();
+        });
+        list->addItem(positionToggle);
+
+        list->addItem(new tsl::elm::CategoryHeader("Key bindings (global)"));
+
+        for (int action = 0; action < switchocr::Action_Count; action++) {
+            auto *item = new tsl::elm::ListItem(switchocr::kActions[action].label);
+            item->setValue(switchocr::nameForMask(g_bindings.mask[action]));
+            m_remapItems[action] = item;
+            item->setClickListener([this, action](u64 keys) {
+                if (keys & HidNpadButton_A) {
+                    m_capturing = action;
+                    m_captureArmed = false;
+                    m_remapItems[action]->setValue("Press button...");
+                    return true;
+                }
+                return false;
+            });
+            list->addItem(item);
+        }
+
+        frame->setContent(list);
+        return frame;
+    }
+
+    // The menu always runs focused so its navigation never leaks to the game.
+    void update() override {
+        tsl::cfg::passthroughMode = false;
+    }
+
+    bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &, HidAnalogStickState, HidAnalogStickState) override {
+        if (m_capturing < 0) {
+            return false;
+        }
+        // Ignore input until the A press that started capture is released.
+        if (!m_captureArmed) {
+            if (!(keysHeld & HidNpadButton_A)) {
+                m_captureArmed = true;
+            }
+            return true;
+        }
+        if (keysDown & HidNpadButton_B) {
+            m_remapItems[m_capturing]->setValue(switchocr::nameForMask(g_bindings.mask[m_capturing]));
+            m_capturing = -1;
+            return true;
+        }
+        for (size_t i = 0; i < switchocr::kButtonCount; i++) {
+            if (keysDown & switchocr::kButtons[i].mask) {
+                g_bindings.mask[m_capturing] = switchocr::kButtons[i].mask;
+                saveKeyBindings();
+                m_remapItems[m_capturing]->setValue(switchocr::kButtons[i].name);
+                m_capturing = -1;
+                return true;
+            }
+        }
+        return true;
+    }
+
+private:
+    tsl::elm::ListItem *m_remapItems[switchocr::Action_Count] = {};
+    int m_capturing = -1;
+    bool m_captureArmed = false;
+};
 
 class SwitchOcrGui final : public tsl::Gui {
 public:
     tsl::elm::Element *createUI() override {
+        loadSettings();
         refreshDisplayFiles();
         return new HudElement();
     }
 
     void update() override {
+        tsl::cfg::passthroughMode = g_passthrough;
         if (++m_refresh_tick >= 15) {
+            const u64 currentProgram = tsl::hlp::getForegroundProgramId();
+            if (currentProgram != g_program_id) {
+                g_program_id = currentProgram;
+                loadGameSettings();
+            }
             refreshDisplayFiles();
             m_refresh_tick = 0;
         }
+    }
+
+    // Hold ZL+ZR and press Up to open the settings/remap menu.
+    bool handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &, HidAnalogStickState, HidAnalogStickState) override {
+        constexpr u64 modifier = HidNpadButton_ZL | HidNpadButton_ZR;
+        if ((keysHeld & modifier) == modifier && (keysDown & HidNpadButton_Up)) {
+            tsl::changeTo<SettingsGui>();
+            return true;
+        }
+        return false;
     }
 
     class HudElement final : public tsl::elm::Element {
@@ -550,13 +727,14 @@ public:
             renderer->clearScreen();
 
             constexpr s32 panel_x = 0;
-            constexpr s32 panel_y = 636;
             constexpr s32 panel_w = 1280;
             constexpr s32 panel_h = 84;
+            const s32 panel_y = g_position_top ? 0 : 636;
             renderer->drawRect(panel_x, panel_y, panel_w, panel_h, tsl::Color(0, 0, 0, 11));
 
             drawParagraph(renderer, panel_x + 16, panel_y + 26, panel_w - 32);
             drawTargetRow(renderer, panel_x + 16, panel_y + 54, panel_w - 32);
+            drawStatusToggles(renderer, panel_x, panel_y, panel_w);
         }
 
         void layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeight) override {
@@ -661,6 +839,17 @@ public:
                 appendBytes(lines[line], sizes[line], cursor, charLen);
                 cursor += charLen;
             }
+        }
+
+        void drawStatusToggles(tsl::gfx::Renderer *renderer, s32 panelX, s32 panelY, s32 panelW) {
+            char text[24];
+            snprintf(text, sizeof(text), "%s  %s",
+                     g_passthrough ? "HUD" : "FOCUS",
+                     g_position_top ? "TOP" : "BOT");
+            constexpr float size = 11.0F;
+            const s32 width = measureText(renderer, text, size);
+            const s32 x = panelX + panelW - width - 10;
+            drawText(renderer, text, x, panelY + 12, size, tsl::Color(11, 11, 11, 15), width + 8, false);
         }
 
         void drawPlainParagraph(tsl::gfx::Renderer *renderer, const char *text, s32 x, s32 y, s32 maxWidth) {
