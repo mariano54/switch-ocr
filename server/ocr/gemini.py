@@ -31,7 +31,7 @@ GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 def _log(message: str) -> None:
     try:
-        print(message, flush=True)
+        print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
     except OSError:
         pass
 
@@ -135,7 +135,7 @@ class GeminiOcrProvider:
 
         words = enrich_words(normalize_words(parsed.get("words") if isinstance(parsed, dict) else []))
         elapsed = time.time() - started
-        _log(f"[GeminiOCR] {elapsed:.2f}s, words={len(words)}")
+        _log(f"[GeminiOCR] model={self.model} bytes={len(image_bytes)} total={elapsed:.2f}s words={len(words)}")
         return {
             "success": True,
             "provider": self.name,

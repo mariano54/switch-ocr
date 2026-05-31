@@ -25,7 +25,7 @@ MINING_SERVICE: MiningService | None = None
 
 def log(message: str) -> None:
     try:
-        print(message, flush=True)
+        print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
     except OSError:
         pass
 
@@ -172,6 +172,12 @@ class OcrDevHandler(BaseHTTPRequestHandler):
                     "source": str(LAST_OCR_UPLOAD),
                 }
             status = HTTPStatus.OK if payload.get("ok") else HTTPStatus.SERVICE_UNAVAILABLE
+            words = payload.get("words")
+            log(
+                f"[ocr-upload] {len(body)}B ok={payload.get('ok')} "
+                f"elapsed={payload.get('ocr_elapsed_seconds')}s "
+                f"words={len(words) if isinstance(words, list) else 0}"
+            )
             self._send_json(payload, status)
             return
 
