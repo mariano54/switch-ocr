@@ -26,3 +26,15 @@ def google_api_key() -> str | None:
 
 def gemini_model() -> str:
     return os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
+
+def openai_api_key() -> str | None:
+    return os.getenv("OAI_KEY") or os.getenv("OPENAI_API_KEY")
+
+
+def openai_model() -> str:
+    return os.getenv("OPENAI_OCR_MODEL", "gpt-5.2-chat-latest")
+
+
+def ocr_provider() -> str:
+    return os.getenv("OCR_PROVIDER", "gemini")
