@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import re
 import socket
+import ssl
+import threading
 import time
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
 
 from .config import gemini_model, google_api_key
 from .enrichment import enrich_words
@@ -19,18 +20,41 @@ from .types import OcrResult
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
-# We stream the response (SSE) so a stall is detected by the gap between chunks
-# rather than waiting for the whole reply. The connection timeout must be
-# generous enough to cover connecting plus uploading the (~180 KB) image plus
-# the first response, otherwise a slow upload trips the timeout and the request
-# is retried (re-uploading), which spirals under load. Once the stream is
-# flowing, the per-chunk read timeout is tightened so a silent connection is
-# cancelled quickly.
-GEMINI_CONNECT_TIMEOUT_SECONDS = 10.0     # connect + image upload + first response
+GEMINI_HOST = "generativelanguage.googleapis.com"
+
+# Opening a fresh TLS connection per request stalls on the handshake ~30% of the
+# time, so we keep a persistent keep-alive connection and reuse it (guarded by a
+# lock since the server is multithreaded). The connect/first-byte timeout only
+# needs to cover the rare case of (re)establishing the connection plus uploading
+# the image; once the stream is flowing the per-chunk read timeout is tightened.
+GEMINI_CONNECT_TIMEOUT_SECONDS = 5.0      # connect + image upload + first response
 GEMINI_STREAM_READ_TIMEOUT_SECONDS = 5.0  # max gap between streamed chunks
-GEMINI_TOTAL_DEADLINE_SECONDS = 16.0      # hard cap across all attempts
-GEMINI_MAX_ATTEMPTS = 3
+GEMINI_TOTAL_DEADLINE_SECONDS = 18.0      # hard cap across all attempts
+GEMINI_MAX_ATTEMPTS = 4
 GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+_conn_lock = threading.Lock()
+_conn: http.client.HTTPSConnection | None = None
+_ssl_ctx = ssl.create_default_context()
+
+
+def _get_connection() -> http.client.HTTPSConnection:
+    global _conn
+    if _conn is None:
+        _conn = http.client.HTTPSConnection(
+            GEMINI_HOST, timeout=GEMINI_CONNECT_TIMEOUT_SECONDS, context=_ssl_ctx
+        )
+    return _conn
+
+
+def _drop_connection() -> None:
+    global _conn
+    if _conn is not None:
+        try:
+            _conn.close()
+        except OSError:
+            pass
+        _conn = None
 
 
 def _log(message: str) -> None:
@@ -113,18 +137,13 @@ class GeminiOcrProvider:
             ],
         }
 
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
+        path = (
+            "/v1beta/models/"
             f"{quote(self.model, safe='')}:streamGenerateContent?alt=sse&key={quote(api_key, safe='')}"
         )
-        request = Request(
-            url,
-            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
-        response_text, error = self._stream_text(request)
+        response_text, error = self._stream_text(path, body)
         if error is not None:
             return self._error(error)
         if not response_text:
@@ -150,33 +169,43 @@ class GeminiOcrProvider:
             "definitions": definition_lines(words),
         }
 
-    def _stream_text(self, request: Request) -> tuple[str | None, str | None]:
-        """Streams the model output, returning (text, None) on success or
-        (None, error) on failure.
+    def _stream_text(self, path: str, body: bytes) -> tuple[str | None, str | None]:
+        """Streams the model output over a reused keep-alive connection,
+        returning (text, None) on success or (None, error) on failure.
 
-        The socket read timeout (GEMINI_STREAM_READ_TIMEOUT_SECONDS) bounds the
-        wait for each streamed chunk, so a connection that goes silent is
-        cancelled within seconds rather than hanging. Transient failures are
-        retried up to GEMINI_MAX_ATTEMPTS within GEMINI_TOTAL_DEADLINE_SECONDS.
+        Reusing the connection avoids the ~30% per-connection TLS-handshake
+        stalls. On any failure the connection is dropped and re-established on
+        the next attempt. Retries up to GEMINI_MAX_ATTEMPTS within
+        GEMINI_TOTAL_DEADLINE_SECONDS; once streaming, the per-chunk read timeout
+        bounds a silent stream.
         """
+        headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
         deadline = time.time() + GEMINI_TOTAL_DEADLINE_SECONDS
         last_error = "Gemini request failed"
-        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
-            if time.time() >= deadline:
-                break
-            started = time.time()
-            chunks: list[str] = []
-            try:
-                with urlopen(request, timeout=GEMINI_CONNECT_TIMEOUT_SECONDS) as response:
-                    # Connect/upload used the generous timeout above; now that the
-                    # response is streaming, tighten the per-chunk read timeout so a
-                    # stalled stream is cancelled quickly.
-                    raw_sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
-                    if raw_sock is not None:
-                        try:
-                            raw_sock.settimeout(GEMINI_STREAM_READ_TIMEOUT_SECONDS)
-                        except OSError:
-                            pass
+        with _conn_lock:
+            for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+                if time.time() >= deadline:
+                    break
+                started = time.time()
+                chunks: list[str] = []
+                try:
+                    conn = _get_connection()
+                    conn.request("POST", path, body=body, headers=headers)
+                    response = conn.getresponse()
+
+                    if response.status != 200:
+                        detail = response.read().decode("utf-8", errors="replace")[:240]
+                        last_error = f"Gemini HTTP {response.status}: {detail}"
+                        _drop_connection()
+                        if response.status not in GEMINI_RETRY_STATUS:
+                            return None, last_error
+                        _log(f"[GeminiOCR] attempt {attempt}/{GEMINI_MAX_ATTEMPTS}: {last_error}")
+                        continue
+
+                    # Connection/first-byte succeeded; tighten the per-chunk timeout.
+                    if conn.sock is not None:
+                        conn.sock.settimeout(GEMINI_STREAM_READ_TIMEOUT_SECONDS)
+
                     for raw_line in response:
                         if time.time() >= deadline:
                             raise TimeoutError("exceeded total deadline")
@@ -189,19 +218,21 @@ class GeminiOcrProvider:
                         fragment = self._chunk_text(data)
                         if fragment:
                             chunks.append(fragment)
-                text = "".join(chunks)
-                if text:
-                    _log(f"[GeminiOCR] stream ok in {time.time() - started:.2f}s (attempt {attempt})")
-                    return text, None
-                last_error = "Gemini returned no streamed text"
-            except HTTPError as error:
-                detail = error.read().decode("utf-8", errors="replace")
-                last_error = f"Gemini HTTP {error.code}: {detail}"
-                if error.code not in GEMINI_RETRY_STATUS:
-                    return None, last_error
-            except (socket.timeout, TimeoutError, URLError) as error:
-                last_error = f"Gemini stream stalled: {error}"
-            _log(f"[GeminiOCR] attempt {attempt}/{GEMINI_MAX_ATTEMPTS} failed in {time.time() - started:.2f}s: {last_error}")
+
+                    # Restore the connect timeout so the reused connection is ready.
+                    if conn.sock is not None:
+                        conn.sock.settimeout(GEMINI_CONNECT_TIMEOUT_SECONDS)
+
+                    text = "".join(chunks)
+                    if text:
+                        _log(f"[GeminiOCR] stream ok in {time.time() - started:.2f}s (attempt {attempt})")
+                        return text, None
+                    last_error = "Gemini returned no streamed text"
+                    _drop_connection()
+                except (socket.timeout, TimeoutError, OSError, http.client.HTTPException) as error:
+                    last_error = f"Gemini stream stalled: {error}"
+                    _drop_connection()
+                _log(f"[GeminiOCR] attempt {attempt}/{GEMINI_MAX_ATTEMPTS} failed in {time.time() - started:.2f}s: {last_error}")
 
         return None, last_error
 
