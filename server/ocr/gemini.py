@@ -23,20 +23,22 @@ JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 GEMINI_HOST = "generativelanguage.googleapis.com"
 
 # A fresh TLS connection stalls on first-byte ~30% of the time, but a warm
-# reused connection is reliable (0 stalls). Reuse the connection while it is
-# fresh; after a long idle period, drop it before the next real OCR request so
-# we don't reuse a stale socket. This does not send background/ping requests.
+# reused connection is reliable (0 stalls). Keep the shared connection warm with
+# a lightweight model-metadata GET while idle. This does not run OCR or generate
+# tokens, but it does make a non-generation Gemini API request every interval.
 GEMINI_CONNECT_TIMEOUT_SECONDS = 5.0       # connect + image upload + first response
 GEMINI_STREAM_READ_TIMEOUT_SECONDS = 5.0   # max gap between streamed chunks
 GEMINI_TOTAL_DEADLINE_SECONDS = 18.0       # hard cap across all attempts
 GEMINI_MAX_ATTEMPTS = 5
-GEMINI_IDLE_EXPIRY_SECONDS = 30.0          # reconnect rather than reuse if idle longer
+GEMINI_KEEPALIVE_INTERVAL_SECONDS = 30.0
+GEMINI_IDLE_EXPIRY_SECONDS = 75.0          # reconnect rather than reuse if idle longer
 GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 _conn_lock = threading.Lock()
 _conn: http.client.HTTPSConnection | None = None
 _conn_last_used = 0.0
 _ssl_ctx = ssl.create_default_context()
+_keepalive_thread: threading.Thread | None = None
 
 
 def _get_connection() -> http.client.HTTPSConnection:
@@ -61,6 +63,34 @@ def _drop_connection() -> None:
         except OSError:
             pass
         _conn = None
+
+
+def _keepalive_loop() -> None:
+    global _conn_last_used
+    while True:
+        time.sleep(GEMINI_KEEPALIVE_INTERVAL_SECONDS)
+        api_key = google_api_key()
+        if not api_key:
+            continue
+        with _conn_lock:
+            if _conn is None or (time.time() - _conn_last_used) < GEMINI_KEEPALIVE_INTERVAL_SECONDS:
+                continue
+            path = f"/v1beta/models/{quote(gemini_model(), safe='')}?key={quote(api_key, safe='')}"
+            try:
+                _conn.request("GET", path, headers={"Connection": "keep-alive"})
+                _conn.getresponse().read()
+                _conn_last_used = time.time()
+            except (OSError, http.client.HTTPException):
+                _drop_connection()
+
+
+def _ensure_keepalive() -> None:
+    global _keepalive_thread
+    if _keepalive_thread is None:
+        _keepalive_thread = threading.Thread(
+            target=_keepalive_loop, name="gemini-keepalive", daemon=True
+        )
+        _keepalive_thread.start()
 
 
 def _log(message: str) -> None:
@@ -186,6 +216,7 @@ class GeminiOcrProvider:
         bounds a silent stream.
         """
         global _conn_last_used
+        _ensure_keepalive()
         headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
         deadline = time.time() + GEMINI_TOTAL_DEADLINE_SECONDS
         last_error = "Gemini request failed"
