@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import socket
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -17,6 +18,15 @@ from .types import OcrResult
 
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+# We stream the response (SSE) so a stall is detected by the gap between chunks
+# rather than waiting for the whole reply. A healthy gemini-3.5-flash call emits
+# its first chunk in ~1s; if no chunk arrives within the read timeout the
+# connection is considered stalled and the attempt is cancelled and retried.
+GEMINI_STREAM_READ_TIMEOUT_SECONDS = 4.0  # max wait for the next streamed chunk
+GEMINI_TOTAL_DEADLINE_SECONDS = 12.0      # hard cap across all attempts
+GEMINI_MAX_ATTEMPTS = 3
+GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
 def _log(message: str) -> None:
@@ -101,7 +111,7 @@ class GeminiOcrProvider:
 
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{quote(self.model, safe='')}:generateContent?key={quote(api_key, safe='')}"
+            f"{quote(self.model, safe='')}:streamGenerateContent?alt=sse&key={quote(api_key, safe='')}"
         )
         request = Request(
             url,
@@ -110,17 +120,11 @@ class GeminiOcrProvider:
             method="POST",
         )
 
-        try:
-            with urlopen(request, timeout=120) as response:
-                raw_response = json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            return self._error(f"Gemini HTTP {error.code}: {error.read().decode('utf-8', errors='replace')}")
-        except (URLError, TimeoutError, json.JSONDecodeError) as error:
-            return self._error(f"Gemini request failed: {error}")
-
-        response_text = self._extract_text(raw_response)
+        response_text, error = self._stream_text(request)
+        if error is not None:
+            return self._error(error)
         if not response_text:
-            return self._error("Gemini returned no text content", raw_response)
+            return self._error("Gemini returned no text content")
 
         try:
             parsed = json.loads(response_text)
@@ -141,6 +145,61 @@ class GeminiOcrProvider:
             "display_text": self._switch_display(words),
             "definitions": definition_lines(words),
         }
+
+    def _stream_text(self, request: Request) -> tuple[str | None, str | None]:
+        """Streams the model output, returning (text, None) on success or
+        (None, error) on failure.
+
+        The socket read timeout (GEMINI_STREAM_READ_TIMEOUT_SECONDS) bounds the
+        wait for each streamed chunk, so a connection that goes silent is
+        cancelled within seconds rather than hanging. Transient failures are
+        retried up to GEMINI_MAX_ATTEMPTS within GEMINI_TOTAL_DEADLINE_SECONDS.
+        """
+        deadline = time.time() + GEMINI_TOTAL_DEADLINE_SECONDS
+        last_error = "Gemini request failed"
+        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            if time.time() >= deadline:
+                break
+            started = time.time()
+            chunks: list[str] = []
+            try:
+                with urlopen(request, timeout=GEMINI_STREAM_READ_TIMEOUT_SECONDS) as response:
+                    for raw_line in response:
+                        if time.time() >= deadline:
+                            raise TimeoutError("exceeded total deadline")
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        fragment = self._chunk_text(data)
+                        if fragment:
+                            chunks.append(fragment)
+                text = "".join(chunks)
+                if text:
+                    _log(f"[GeminiOCR] stream ok in {time.time() - started:.2f}s (attempt {attempt})")
+                    return text, None
+                last_error = "Gemini returned no streamed text"
+            except HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")
+                last_error = f"Gemini HTTP {error.code}: {detail}"
+                if error.code not in GEMINI_RETRY_STATUS:
+                    return None, last_error
+            except (socket.timeout, TimeoutError, URLError) as error:
+                last_error = f"Gemini stream stalled: {error}"
+            _log(f"[GeminiOCR] attempt {attempt}/{GEMINI_MAX_ATTEMPTS} failed in {time.time() - started:.2f}s: {last_error}")
+
+        return None, last_error
+
+    def _chunk_text(self, data: str) -> str:
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(parsed, dict):
+            return ""
+        return self._extract_text(parsed)
 
     def _error(self, message: str, raw: Any | None = None) -> OcrResult:
         result: OcrResult = {
