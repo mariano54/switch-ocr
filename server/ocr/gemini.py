@@ -20,11 +20,15 @@ from .types import OcrResult
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 # We stream the response (SSE) so a stall is detected by the gap between chunks
-# rather than waiting for the whole reply. A healthy gemini-3.5-flash call emits
-# its first chunk in ~1s; if no chunk arrives within the read timeout the
-# connection is considered stalled and the attempt is cancelled and retried.
-GEMINI_STREAM_READ_TIMEOUT_SECONDS = 4.0  # max wait for the next streamed chunk
-GEMINI_TOTAL_DEADLINE_SECONDS = 12.0      # hard cap across all attempts
+# rather than waiting for the whole reply. The connection timeout must be
+# generous enough to cover connecting plus uploading the (~180 KB) image plus
+# the first response, otherwise a slow upload trips the timeout and the request
+# is retried (re-uploading), which spirals under load. Once the stream is
+# flowing, the per-chunk read timeout is tightened so a silent connection is
+# cancelled quickly.
+GEMINI_CONNECT_TIMEOUT_SECONDS = 10.0     # connect + image upload + first response
+GEMINI_STREAM_READ_TIMEOUT_SECONDS = 5.0  # max gap between streamed chunks
+GEMINI_TOTAL_DEADLINE_SECONDS = 16.0      # hard cap across all attempts
 GEMINI_MAX_ATTEMPTS = 3
 GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
 
@@ -90,8 +94,8 @@ class GeminiOcrProvider:
                 }
             ],
             "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 1024,
+            "temperature": 0.1,
+            "maxOutputTokens": 4096,
                 "responseMimeType": "application/json",
                 "responseSchema": OCR_RESPONSE_SCHEMA,
                 "candidateCount": 1,
@@ -163,7 +167,16 @@ class GeminiOcrProvider:
             started = time.time()
             chunks: list[str] = []
             try:
-                with urlopen(request, timeout=GEMINI_STREAM_READ_TIMEOUT_SECONDS) as response:
+                with urlopen(request, timeout=GEMINI_CONNECT_TIMEOUT_SECONDS) as response:
+                    # Connect/upload used the generous timeout above; now that the
+                    # response is streaming, tighten the per-chunk read timeout so a
+                    # stalled stream is cancelled quickly.
+                    raw_sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                    if raw_sock is not None:
+                        try:
+                            raw_sock.settimeout(GEMINI_STREAM_READ_TIMEOUT_SECONDS)
+                        except OSError:
+                            pass
                     for raw_line in response:
                         if time.time() >= deadline:
                             raise TimeoutError("exceeded total deadline")

@@ -5,7 +5,7 @@ cd "$HOME/Projects/SwitchOCR"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PYTHONUNBUFFERED=1
-export GEMINI_MODEL="${GEMINI_MODEL:-gemini-3.1-flash-lite}"
+export GEMINI_MODEL="${GEMINI_MODEL:-gemini-3-flash-preview}"
 PORT="${SWITCHOCR_PORT:-8742}"
 
 # Free the port from any leftover instance so we don't crash-loop on bind.
